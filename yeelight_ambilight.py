@@ -1,1030 +1,457 @@
+#!/usr/bin/env python3
+"""
+Yeelight Ambilight v0.4 - screen-top sync for the Yeelight Monitor Light Bar Pro (lamp15).
 
+How the lamp is driven (measured on lamp15, fw 38):
+  * set_segment_rgb carries COLOR ONLY (RGB magnitude is ignored), so each side
+    gets a fully-bright, normalised color ("chroma");
+  * brightness is global (bg_set_bright) and follows the scene brightness ("luma");
+  * both go over the UDP realtime session; power on/off goes over TCP and only
+    after a sustained dark scene, because the lamp needs about a second to switch.
+"""
+
+import argparse
+import colorsys
+import dataclasses
 import json
-import socket
+import math
+import sys
+import threading
 import time
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
-import mss
 from PIL import Image
 
+import yeelight_lan as lan
+
+RGBf = Tuple[float, float, float]
+
 
 # ============================================================
-# Configuration
+# Configuration (override with --config config.json or CLI flags)
 # ============================================================
 
-YEELIGHT_IP = "192.168.0.228"
+@dataclass
+class Config:
+    ip: Optional[str] = None          # None = auto-discovery
+    monitor: int = 1                  # mss monitor index (1 = primary)
+    top_percent: float = 0.15
+    capture_fps: int = 60
+    send_fps: int = 30                # lamp frames per second (UDP)
+    bright_fps: int = 15              # max bg_set_bright updates per second
+    refresh_s: float = 0.5            # resend unchanged state (packet-loss repair)
 
-TCP_PORT = 55443
-UDP_PORT = 55444
+    center_overlap: float = 0.08      # L/R overlap around the middle
 
-# Screen
-TOP_PERCENT = 0.15
+    # brightness (global, 1..100)
+    bright_min: int = 1
+    bright_max: int = 60
+    bright_gamma: float = 0.9
+    bright_deadband: int = 2
+    luma_mix: float = 0.5             # 0 = mean of sides, 1 = brighter side
 
-# Capture loop
-FPS = 30
+    # color
+    sat_boost: float = 1.1
+    chroma_min: float = 10.0          # below this a side is too dark to trust its color
 
-# Actual background brightness.
-#
-# IMPORTANT:
-# lamp15 set_segment_rgb ignores RGB magnitude.
-# Brightness is controlled separately with bg_set_bright.
-BG_BRIGHTNESS = 60
+    # smoothing (time constants in seconds)
+    tau_slow: float = 0.15
+    tau_fast: float = 0.02
+    cut_distance: float = 60.0        # chroma change that counts as a fast scene
+    luma_tau_up: float = 0.04
+    luma_tau_down: float = 0.25
+    luma_cut: float = 70.0            # luma jump that bypasses smoothing
 
-# Very dark screen = black.
-BLACK_THRESHOLD = 7
+    # dark scenes
+    black_threshold: float = 7.0
+    wake_threshold: float = 12.0
+    dark_hold_s: float = 2.0          # darkness must last this long before power off
+    wake_frames: int = 2
 
-# ------------------------------------------------------------
-# L/R sampling
-# ------------------------------------------------------------
 
-# Slight overlap around the center prevents a hard seam.
-CENTER_OVERLAP = 0.08
+# ============================================================
+# Screen analysis
+# ============================================================
 
-# Number of horizontal sampling bands.
-SAMPLE_ROWS = 7
+GRID_COLS = 16
+GRID_ROWS = 3
 
-# ------------------------------------------------------------
-# Adaptive smoothing
-# ------------------------------------------------------------
 
-# Slow changes are smoothed.
-BASE_SMOOTHING = 0.65
+def analyze_strip(img: Image.Image, overlap: float) -> Tuple[RGBf, RGBf]:
+    """Average color of the left and right part of a strip, using one BOX resize."""
+    small = img.resize((GRID_COLS, GRID_ROWS), Image.Resampling.BOX)
+    data = small.tobytes()
 
-# Fast changes almost bypass smoothing.
-FAST_SMOOTHING = 0.95
+    cols = []
+    for c in range(GRID_COLS):
+        r = g = b = 0
+        for row in range(GRID_ROWS):
+            i = (row * GRID_COLS + c) * 3
+            r += data[i]
+            g += data[i + 1]
+            b += data[i + 2]
+        cols.append((r / GRID_ROWS, g / GRID_ROWS, b / GRID_ROWS))
 
-# Distance at which we consider a color change "fast".
-FAST_CHANGE_THRESHOLD = 60.0
+    half = GRID_COLS // 2
+    ov = max(0, round(GRID_COLS * overlap / 2))
 
-# ------------------------------------------------------------
-# Segment update rate
-# ------------------------------------------------------------
+    def mean(part):
+        n = len(part)
+        return (sum(p[0] for p in part) / n,
+                sum(p[1] for p in part) / n,
+                sum(p[2] for p in part) / n)
 
-# TCP limit is roughly 10 commands/sec.
-#
-# We stay slightly below it.
-SEGMENT_FPS = 9
+    return mean(cols[: half + ov]), mean(cols[half - ov:])
 
-# ------------------------------------------------------------
-# UDP keepalive
-# ------------------------------------------------------------
+
+# ============================================================
+# Color / brightness pipeline (pure logic, no I/O)
+# ============================================================
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return lo if v < lo else hi if v > hi else v
+
+
+def ema(prev: float, target: float, dt: float, tau: float) -> float:
+    if tau <= 0:
+        return target
+    return prev + (target - prev) * (1.0 - math.exp(-dt / tau))
+
+
+def distance(a: RGBf, b: RGBf) -> float:
+    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+
+def normalize_chroma(rgb: RGBf, sat_boost: float) -> RGBf:
+    """Full-value color with the same hue; saturation slightly boosted."""
+    h, s, _ = colorsys.rgb_to_hsv(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255)
+    r, g, b = colorsys.hsv_to_rgb(h, min(1.0, s * sat_boost), 1.0)
+    return (r * 255, g * 255, b * 255)
+
+
+@dataclass
+class Output:
+    power: bool
+    left: int
+    right: int
+    bright: int
+
+
+class Pipeline:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.chroma = [None, None]
+        self.luma: Optional[float] = None
+        self.last_t: Optional[float] = None
+        self.state = "active"          # active | off
+        self.dark_since: Optional[float] = None
+        self.wake_count = 0
+        self.bright = cfg.bright_max
+        self.out = Output(True, lan.rgb_to_int((255, 255, 255)), lan.rgb_to_int((255, 255, 255)),
+                          cfg.bright_max)
+
+    def _map_bright(self, luma: float) -> int:
+        cfg = self.cfg
+        if luma <= cfg.black_threshold:
+            return cfg.bright_min
+        x = clamp(luma / 255.0, 0.0, 1.0) ** cfg.bright_gamma
+        return int(round(cfg.bright_min + (cfg.bright_max - cfg.bright_min) * x))
+
+    def process(self, left: RGBf, right: RGBf, now: float) -> Output:
+        cfg = self.cfg
+        dt = 1 / 60 if self.last_t is None else clamp(now - self.last_t, 0.001, 0.25)
+        self.last_t = now
+
+        sides = (left, right)
+        side_max = [max(s) for s in sides]
+        top = max(side_max)
+        raw_luma = cfg.luma_mix * top + (1 - cfg.luma_mix) * (side_max[0] + side_max[1]) / 2
+        dark = top <= cfg.black_threshold
+
+        # --- power state with hysteresis ------------------------------
+        if self.state == "active":
+            if dark:
+                if self.dark_since is None:
+                    self.dark_since = now
+                elif now - self.dark_since >= cfg.dark_hold_s:
+                    self.state = "off"
+                    self.wake_count = 0
+            else:
+                self.dark_since = None
+        else:
+            if top > cfg.wake_threshold:
+                self.wake_count += 1
+                if self.wake_count >= cfg.wake_frames:
+                    self.state = "active"
+                    self.dark_since = None
+                    self.luma = None          # snap to the new scene
+                    self.chroma = [None, None]
+            else:
+                self.wake_count = 0
+
+        if self.state == "off":
+            self.out = Output(False, self.out.left, self.out.right, self.out.bright)
+            return self.out
+
+        # --- chroma per side ------------------------------------------
+        for i in (0, 1):
+            if side_max[i] < cfg.chroma_min:
+                continue                       # too dark: hold the last color
+            target = normalize_chroma(sides[i], cfg.sat_boost)
+            prev = self.chroma[i]
+            if prev is None:
+                self.chroma[i] = target
+            else:
+                ratio = min(1.0, distance(prev, target) / cfg.cut_distance)
+                tau = cfg.tau_slow + (cfg.tau_fast - cfg.tau_slow) * ratio
+                self.chroma[i] = tuple(ema(p, t, dt, tau) for p, t in zip(prev, target))
+
+        white = (255.0, 255.0, 255.0)
+        c_left = self.chroma[0] or white
+        c_right = self.chroma[1] or white
+
+        # --- global brightness ----------------------------------------
+        target_luma = 0.0 if dark else raw_luma
+        if self.luma is None or abs(target_luma - self.luma) >= cfg.luma_cut:
+            self.luma = target_luma
+        else:
+            tau = cfg.luma_tau_up if target_luma > self.luma else cfg.luma_tau_down
+            self.luma = ema(self.luma, target_luma, dt, tau)
+
+        new_bright = self._map_bright(self.luma)
+        at_edge = new_bright in (cfg.bright_min, cfg.bright_max)
+        if at_edge or abs(new_bright - self.bright) >= cfg.bright_deadband:
+            self.bright = new_bright
+
+        self.out = Output(
+            True,
+            lan.rgb_to_int(tuple(int(round(v)) for v in c_left)),
+            lan.rgb_to_int(tuple(int(round(v)) for v in c_right)),
+            self.bright,
+        )
+        return self.out
+
+
+# ============================================================
+# Sender thread: the only place that talks to the lamp
+# ============================================================
 
 KEEPALIVE_INTERVAL = 8.0
-
-
-RGB = Tuple[int, int, int]
-
-
-# ============================================================
-# RGB helpers
-# ============================================================
-
-def rgb_to_int(rgb: RGB) -> int:
-    r, g, b = rgb
-
-    return (
-        (r << 16)
-        | (g << 8)
-        | b
-    )
-
-
-def color_brightness(rgb: RGB) -> int:
-    return max(rgb)
-
-
-def color_distance(
-    a: RGB,
-    b: RGB,
-) -> float:
-
-    return (
-        (
-            (a[0] - b[0]) ** 2
-            + (a[1] - b[1]) ** 2
-            + (a[2] - b[2]) ** 2
-        )
-        ** 0.5
-    )
-
-
-def adaptive_smoothing(
-    previous: Optional[RGB],
-    current: RGB,
-) -> float:
-
-    if previous is None:
-        return 1.0
-
-    distance = color_distance(
-        previous,
-        current,
-    )
-
-    if distance >= FAST_CHANGE_THRESHOLD:
-        return FAST_SMOOTHING
-
-    ratio = (
-        distance
-        / FAST_CHANGE_THRESHOLD
-    )
-
-    return (
-        BASE_SMOOTHING
-        + (
-            FAST_SMOOTHING
-            - BASE_SMOOTHING
-        )
-        * ratio
-    )
-
-
-def smooth_color(
-    previous: Optional[RGB],
-    current: RGB,
-) -> RGB:
-
-    if previous is None:
-        return current
-
-    amount = adaptive_smoothing(
-        previous,
-        current,
-    )
-
-    return (
-        int(
-            previous[0]
-            + (
-                current[0]
-                - previous[0]
-            )
-            * amount
-        ),
-        int(
-            previous[1]
-            + (
-                current[1]
-                - previous[1]
-            )
-            * amount
-        ),
-        int(
-            previous[2]
-            + (
-                current[2]
-                - previous[2]
-            )
-            * amount
-        ),
-    )
-
-
-# ============================================================
-# Screen sampling
-# ============================================================
-
-def average_pixels(
-    pixels,
-) -> RGB:
-
-    if not pixels:
-        return (0, 0, 0)
-
-    r = 0
-    g = 0
-    b = 0
-    count = 0
-
-    for pixel in pixels:
-        r += pixel[0]
-        g += pixel[1]
-        b += pixel[2]
-        count += 1
-
-    if count == 0:
-        return (0, 0, 0)
-
-    return (
-        r // count,
-        g // count,
-        b // count,
-    )
-
-
-def sample_region(
-    image: Image.Image,
-    x1: int,
-    x2: int,
-) -> RGB:
-
-    width, height = image.size
-
-    x1 = max(
-        0,
-        min(width, x1),
-    )
-
-    x2 = max(
-        0,
-        min(width, x2),
-    )
-
-    if x2 <= x1:
-        return (0, 0, 0)
-
-    pixels = []
-
-    row_height = max(
-        1,
-        height // SAMPLE_ROWS,
-    )
-
-    for row in range(SAMPLE_ROWS):
-
-        y1 = row * row_height
-        y2 = min(
-            height,
-            y1 + row_height,
-        )
-
-        crop = image.crop(
-            (
-                x1,
-                y1,
-                x2,
-                y2,
-            )
-        )
-
-        pixels.extend(
-            crop.getdata()
-        )
-
-    return average_pixels(
-        pixels
-    )
-
-
-def capture_screen_colors(
-    sct: mss.mss,
-) -> Tuple[RGB, RGB]:
-
-    monitor = sct.monitors[1]
-
-    width = monitor["width"]
-    height = monitor["height"]
-
-    capture_height = max(
-        1,
-        int(
-            height
-            * TOP_PERCENT
-        ),
-    )
-
-    screenshot = sct.grab(
-        {
-            "left": monitor["left"],
-            "top": monitor["top"],
-            "width": width,
-            "height": capture_height,
-        }
-    )
-
-    image = Image.frombytes(
-        "RGB",
-        screenshot.size,
-        screenshot.rgb,
-    )
-
-    center = width // 2
-
-    overlap = int(
-        width
-        * CENTER_OVERLAP
-        / 2
-    )
-
-    left_color = sample_region(
-        image,
-        0,
-        center + overlap,
-    )
-
-    right_color = sample_region(
-        image,
-        center - overlap,
-        width,
-    )
-
-    return (
-        left_color,
-        right_color,
-    )
-
-
-# ============================================================
-# TCP Yeelight
-# ============================================================
-
-class YeelightTCP:
-
-    def __init__(self):
-        self.sock: Optional[
-            socket.socket
-        ] = None
-
-        self.request_id = 1
-
-        self.last_segment_send = 0.0
-
-        self.segment_interval = (
-            1.0 / SEGMENT_FPS
-        )
-
-    def connect(self):
-
-        if self.sock is not None:
+SESSION_TIMEOUT = 30.0
+RECOVER_COOLDOWN = 3.0
+
+
+class Sender(threading.Thread):
+    def __init__(self, cfg: Config, conn: lan.Connection):
+        super().__init__(daemon=True)
+        self.cfg = cfg
+        self.conn = conn
+        self.stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._out: Optional[Output] = None
+
+        self.power_actual: Optional[bool] = None
+        self.last_seg: Optional[Tuple[int, int]] = None
+        self.last_seg_t = 0.0
+        self.last_bright: Optional[int] = None
+        self.last_bright_t = 0.0
+        self.last_keepalive = 0.0
+        self.last_recover = 0.0
+        self.frames = 0
+        self.errors = 0
+
+    def submit(self, out: Output) -> None:
+        with self._lock:
+            self._out = out
+
+    def _latest(self) -> Optional[Output]:
+        with self._lock:
+            return self._out
+
+    def run(self) -> None:
+        period = 1.0 / self.cfg.send_fps
+        while not self.stop_event.is_set():
+            t0 = time.monotonic()
+            try:
+                self._tick(t0)
+            except (OSError, ConnectionError, RuntimeError, ValueError) as exc:
+                self.errors += 1
+                print(f"[sender] {type(exc).__name__}: {exc}", file=sys.stderr)
+                self._recover()
+            delay = period - (time.monotonic() - t0)
+            if delay > 0:
+                self.stop_event.wait(delay)
+
+    def _force_resend(self) -> None:
+        self.last_seg = None
+        self.last_bright = None
+
+    def _tick(self, now: float) -> None:
+        cfg = self.cfg
+        out = self._latest()
+        if out is None:
             return
 
-        sock = socket.socket(
-            socket.AF_INET,
-            socket.SOCK_STREAM,
-        )
+        if out.power != self.power_actual:
+            if not self.conn.tcp.set_power(out.power):
+                raise ConnectionError("bg_set_power was not acknowledged")
+            self.power_actual = out.power
+            self._force_resend()
 
-        sock.settimeout(0.25)
+        if self.power_actual:
+            udp = self.conn.udp
+            seg = (out.left, out.right)
+            if seg != self.last_seg or now - self.last_seg_t >= cfg.refresh_s:
+                udp.send("set_segment_rgb", [out.left, out.right])
+                self.last_seg, self.last_seg_t = seg, now
+                self.frames += 1
+            bright_due = now - self.last_bright_t >= 1.0 / cfg.bright_fps
+            if bright_due and (out.bright != self.last_bright
+                               or now - self.last_bright_t >= cfg.refresh_s):
+                udp.send("bg_set_bright", [out.bright, "sudden", 0])
+                self.last_bright, self.last_bright_t = out.bright, now
 
-        sock.connect(
-            (
-                YEELIGHT_IP,
-                TCP_PORT,
-            )
-        )
+        self._housekeeping(now)
 
-        self.sock = sock
+    def _housekeeping(self, now: float) -> None:
+        udp = self.conn.udp
+        if now - self.last_keepalive >= KEEPALIVE_INTERVAL:
+            udp.keepalive()
+            self.last_keepalive = now
+        udp.drain()
+        if now - udp.last_alive > SESSION_TIMEOUT:
+            print("[sender] UDP session silent, opening a new one", file=sys.stderr)
+            udp.open()
+            self._force_resend()
 
-    def close(self):
-
-        if self.sock is not None:
-
-            try:
-                self.sock.close()
-            except Exception:
-                pass
-
-        self.sock = None
-
-    def command(
-        self,
-        method: str,
-        params: list,
-        wait_response: bool = True,
-    ):
-
-        self.connect()
-
-        request_id = self.request_id
-
-        self.request_id += 1
-
-        request = {
-            "id": request_id,
-            "method": method,
-            "params": params,
-        }
-
-        payload = (
-            json.dumps(
-                request,
-                separators=(",", ":"),
-            )
-            + "\r\n"
-        ).encode()
-
-        try:
-
-            self.sock.sendall(
-                payload
-            )
-
-            if not wait_response:
-                return None
-
-            # Read exactly one response.
-            #
-            # This is important because otherwise TCP responses
-            # accumulate in the socket while we keep sending
-            # commands.
-            response = (
-                self.sock.recv(4096)
-            )
-
-            if not response:
-                raise ConnectionError(
-                    "Yeelight closed TCP connection"
-                )
-
-            return json.loads(
-                response.decode()
-            )
-
-        except (
-            OSError,
-            ConnectionError,
-            socket.timeout,
-            json.JSONDecodeError,
-        ):
-
-            self.close()
-
-            raise
-
-    def set_background_brightness(
-        self,
-        brightness: int,
-    ):
-
-        brightness = max(
-            1,
-            min(
-                100,
-                brightness,
-            ),
-        )
-
-        self.command(
-            "bg_set_bright",
-            [
-                brightness,
-                "sudden",
-                0,
-            ],
-            wait_response=True,
-        )
-
-    def background_power(
-        self,
-        power: str,
-    ):
-
-        self.command(
-            "bg_set_power",
-            [
-                power,
-                "sudden",
-                0,
-            ],
-            wait_response=True,
-        )
-
-    def set_segment_rgb(
-        self,
-        left: RGB,
-        right: RGB,
-        force: bool = False,
-    ) -> bool:
-
+    def _recover(self) -> None:
         now = time.monotonic()
-
-        if (
-            not force
-            and (
-                now
-                - self.last_segment_send
-                < self.segment_interval
-            )
-        ):
-            return False
-
-        # ----------------------------------------------------
-        # IMPORTANT:
-        #
-        # RGB magnitude is intentionally NOT brightness-scaled.
-        #
-        # On lamp15:
-        #   0xFF0000 = red
-        #   0x010000 = also red
-        #
-        # Brightness is controlled separately by bg_set_bright.
-        # ----------------------------------------------------
-
-        request = {
-            "id": self.request_id,
-            "method": "set_segment_rgb",
-            "params": [
-                rgb_to_int(left),
-                rgb_to_int(right),
-            ],
-        }
-
-        self.request_id += 1
-
-        payload = (
-            json.dumps(
-                request,
-                separators=(",", ":"),
-            )
-            + "\r\n"
-        ).encode()
-
+        if now - self.last_recover < RECOVER_COOLDOWN:
+            return
+        self.last_recover = now
         try:
+            if self.conn.rediscover():
+                print(f"[sender] lamp moved to {self.conn.ip}", file=sys.stderr)
+            self.conn.reopen_clients()
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"[sender] recovery failed: {exc}", file=sys.stderr)
+            return
+        self.power_actual = None
+        self._force_resend()
 
-            self.connect()
-
-            self.sock.sendall(
-                payload
-            )
-
-            # We MUST consume the response.
-            #
-            # Otherwise responses accumulate and the TCP stream
-            # eventually becomes desynchronized.
-            self.sock.recv(4096)
-
-            self.last_segment_send = now
-
-            return True
-
-        except (
-            OSError,
-            ConnectionError,
-            socket.timeout,
-        ):
-
-            self.close()
-
-            return False
-
-
-# ============================================================
-# UDP realtime
-# ============================================================
-
-class YeelightUDP:
-
-    def __init__(self):
-
-        self.sock = socket.socket(
-            socket.AF_INET,
-            socket.SOCK_DGRAM,
-        )
-
-        self.sock.settimeout(2.0)
-
-        self.token: Optional[str] = None
-
-    def connect(self):
-
-        request = {
-            "id": 1,
-            "method": "udp_sess_new",
-            "params": [],
-        }
-
-        payload = (
-            json.dumps(
-                request,
-                separators=(",", ":"),
-            )
-            + "\r\n"
-        ).encode()
-
-        self.sock.sendto(
-            payload,
-            (
-                YEELIGHT_IP,
-                UDP_PORT,
-            ),
-        )
-
-        data, _ = self.sock.recvfrom(
-            4096
-        )
-
-        response = json.loads(
-            data.decode()
-        )
-
-        params = response.get(
-            "params"
-        )
-
-        if (
-            isinstance(params, dict)
-            and params.get("token")
-        ):
-            self.token = params["token"]
-
-            return self.token
-
-        result = response.get(
-            "result"
-        )
-
-        if (
-            isinstance(result, list)
-            and result
-        ):
-            self.token = result[0]
-
-            return self.token
-
-        raise RuntimeError(
-            f"Could not obtain UDP token: "
-            f"{response}"
-        )
-
-    def command(
-        self,
-        method: str,
-        params: list,
-        command_id: int = 2,
-    ):
-
-        if not self.token:
-            raise RuntimeError(
-                "UDP session is not initialized"
-            )
-
-        request = {
-            "id": command_id,
-            "method": method,
-            "params": params,
-            "token": self.token,
-        }
-
-        payload = (
-            json.dumps(
-                request,
-                separators=(",", ":"),
-            )
-            + "\r\n"
-        ).encode()
-
-        self.sock.sendto(
-            payload,
-            (
-                YEELIGHT_IP,
-                UDP_PORT,
-            ),
-        )
-
-    def keepalive(self):
-
-        self.command(
-            "udp_sess_keep_alive",
-            [
-                "keeplive_interval",
-                "10",
-            ],
-            4,
-        )
-
-    def close(self):
-
+    def shutdown(self) -> None:
+        self.stop_event.set()
+        self.join(timeout=2.0)
         try:
-            self.sock.close()
-        except Exception:
+            self.conn.tcp.set_power(False)
+        except (OSError, AttributeError):
             pass
+        self.conn.close()
 
 
 # ============================================================
 # Main
 # ============================================================
 
-def main():
+def load_config(args: argparse.Namespace) -> Config:
+    cfg = Config()
+    if args.config:
+        with open(args.config, encoding="utf-8") as fh:
+            data = json.load(fh)
+        names = {f.name for f in dataclasses.fields(Config)}
+        unknown = set(data) - names
+        if unknown:
+            sys.exit(f"Unknown config keys: {', '.join(sorted(unknown))}")
+        cfg = dataclasses.replace(cfg, **data)
+    overrides = {
+        "ip": args.ip, "monitor": args.monitor, "send_fps": args.send_fps,
+        "capture_fps": args.capture_fps, "bright_max": args.bright_max,
+    }
+    return dataclasses.replace(cfg, **{k: v for k, v in overrides.items() if v is not None})
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Yeelight Ambilight v0.4")
+    parser.add_argument("--ip", help="lamp IP (default: auto-discovery)")
+    parser.add_argument("--config", help="JSON file with Config overrides")
+    parser.add_argument("--monitor", type=int)
+    parser.add_argument("--send-fps", type=int)
+    parser.add_argument("--capture-fps", type=int)
+    parser.add_argument("--bright-max", type=int)
+    parser.add_argument("--discover", action="store_true", help="list lamps and exit")
+    parser.add_argument("--debug", action="store_true", help="print stats every 2 s")
+    args = parser.parse_args()
+
+    if args.discover:
+        for dev_id, d in lan.discover().items():
+            print(f"{dev_id}  {d['model']}  fw {d['fw_ver']}  {d['ip']}:{d['port']}  power={d['power']}")
+        return
+
+    cfg = load_config(args)
+    conn = lan.Connection(ip=cfg.ip, cache_path="lamp_cache.json")
 
     print("=" * 55)
-    print("Yeelight Ambilight v0.3.1")
+    print("Yeelight Ambilight v0.4")
     print("=" * 55)
+    try:
+        conn.open()
+    except (OSError, RuntimeError, ValueError) as exc:
+        sys.exit(f"Cannot reach the lamp: {exc}")
+    info = conn.info
+    print(f"Lamp: {info.get('model', '?')} fw {info.get('fw_ver', '?')} "
+          f"{conn.ip} id {conn.device_id or 'pinned by --ip'}")
+    print(f"Capture {cfg.capture_fps} fps, lamp {cfg.send_fps} fps, "
+          f"brightness {cfg.bright_min}-{cfg.bright_max}")
+    print("Press Ctrl+C to stop.\n")
 
-    print(
-        f"Yeelight: {YEELIGHT_IP}"
-    )
+    import mss  # imported here so the logic above stays testable without a display
 
-    print(
-        f"Screen: top "
-        f"{TOP_PERCENT * 100:.1f}%"
-    )
-
-    print(
-        f"Capture FPS: {FPS}"
-    )
-
-    print(
-        f"Segment FPS: {SEGMENT_FPS}"
-    )
-
-    print(
-        f"Background brightness: "
-        f"{BG_BRIGHTNESS}%"
-    )
-
-    print()
-    print(
-        "L/R: set_segment_rgb"
-    )
-
-    print(
-        "Black: bg_power OFF"
-    )
-
-    print()
-    print(
-        "Press Ctrl+C to stop."
-    )
-
-    print()
-
-    udp = YeelightUDP()
-    tcp = YeelightTCP()
+    sender = Sender(cfg, conn)
+    pipeline = Pipeline(cfg)
+    sender.start()
 
     try:
-
-        # ----------------------------------------------------
-        # UDP session
-        # ----------------------------------------------------
-
-        token = udp.connect()
-
-        print(
-            f"UDP session: {token}"
-        )
-
-        # ----------------------------------------------------
-        # Configure background brightness ONCE.
-        #
-        # This controls the actual physical brightness of
-        # both L/R segments.
-        # ----------------------------------------------------
-
-        print(
-            "Setting background brightness..."
-        )
-
-        tcp.set_background_brightness(
-            BG_BRIGHTNESS
-        )
-
-        # ----------------------------------------------------
-        # Make sure background is ON before starting.
-        # ----------------------------------------------------
-
-        tcp.background_power(
-            "on"
-        )
-
-        print(
-            "Background ON."
-        )
-
-        print()
-
-        # ----------------------------------------------------
-        # Screen capture
-        # ----------------------------------------------------
-
         with mss.mss() as sct:
+            mon = sct.monitors[cfg.monitor]
+            region = {
+                "left": mon["left"], "top": mon["top"], "width": mon["width"],
+                "height": max(1, int(mon["height"] * cfg.top_percent)),
+            }
+            print(f"Screen {mon['width']}x{mon['height']}, strip {region['height']} px\n")
 
-            monitor = sct.monitors[1]
-
-            print(
-                "Screen: "
-                f"{monitor['width']}x"
-                f"{monitor['height']}"
-            )
-
-            print()
-
-            previous_left: Optional[
-                RGB
-            ] = None
-
-            previous_right: Optional[
-                RGB
-            ] = None
-
-            light_is_off = False
-
-            last_keepalive = (
-                time.monotonic()
-            )
-
-            frame_time = (
-                1.0 / FPS
-            )
-
-            # ------------------------------------------------
-            # Main loop
-            # ------------------------------------------------
+            frame_time = 1.0 / cfg.capture_fps
+            stat_t = time.monotonic()
+            stat_frames = 0
+            stat_cost = 0.0
 
             while True:
+                t0 = time.monotonic()
+                shot = sct.grab(region)
+                img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+                left, right = analyze_strip(img, cfg.center_overlap)
+                out = pipeline.process(left, right, t0)
+                sender.submit(out)
 
-                frame_start = (
-                    time.monotonic()
-                )
+                cost = time.monotonic() - t0
+                stat_frames += 1
+                stat_cost += cost
+                if args.debug and t0 - stat_t >= 2.0:
+                    span = t0 - stat_t
+                    print(f"capture {stat_frames / span:5.1f} fps ({stat_cost / stat_frames * 1000:4.1f} ms/frame)"
+                          f" | lamp frames {sender.frames / span:5.1f}/s | bright {out.bright:3d}"
+                          f" | power {'on ' if out.power else 'off'} | errors {sender.errors}")
+                    stat_t, stat_frames, stat_cost = t0, 0, 0.0
+                    sender.frames = 0
 
-                # --------------------------------------------
-                # Capture
-                # --------------------------------------------
-
-                (
-                    left_raw,
-                    right_raw,
-                ) = capture_screen_colors(
-                    sct
-                )
-
-                # --------------------------------------------
-                # Detect black
-                # --------------------------------------------
-
-                max_brightness = max(
-                    color_brightness(
-                        left_raw
-                    ),
-                    color_brightness(
-                        right_raw
-                    ),
-                )
-
-                if (
-                    max_brightness
-                    <= BLACK_THRESHOLD
-                ):
-
-                    # ----------------------------------------
-                    # IMPORTANT:
-                    #
-                    # DO NOT send bg_set_rgb(0,0,0).
-                    #
-                    # That resets set_segment_rgb state.
-                    #
-                    # Also DO NOT send set_segment_rgb(0,0).
-                    # Its behavior is undefined.
-                    #
-                    # For a true physical dark we have to turn
-                    # the background channel off.
-                    # ----------------------------------------
-
-                    if not light_is_off:
-
-                        try:
-
-                            tcp.background_power(
-                                "off"
-                            )
-
-                        except Exception:
-                            pass
-
-                        light_is_off = True
-
-                    previous_left = (
-                        left_raw
-                    )
-
-                    previous_right = (
-                        right_raw
-                    )
-
-                else:
-
-                    # ----------------------------------------
-                    # Screen became non-black.
-                    # ----------------------------------------
-
-                    if light_is_off:
-
-                        # Turn the background back on.
-                        #
-                        # Brightness remains configured at
-                        # BG_BRIGHTNESS.
-                        try:
-
-                            tcp.background_power(
-                                "on"
-                            )
-
-                            # Force the first L/R update after
-                            # waking the background.
-                            tcp.set_segment_rgb(
-                                left_raw,
-                                right_raw,
-                                force=True,
-                            )
-
-                        except Exception:
-                            pass
-
-                        light_is_off = False
-
-                        previous_left = (
-                            left_raw
-                        )
-
-                        previous_right = (
-                            right_raw
-                        )
-
-                    else:
-
-                        # ------------------------------------
-                        # Adaptive smoothing
-                        # ------------------------------------
-
-                        left = smooth_color(
-                            previous_left,
-                            left_raw,
-                        )
-
-                        right = smooth_color(
-                            previous_right,
-                            right_raw,
-                        )
-
-                        previous_left = left
-                        previous_right = right
-
-                        # ------------------------------------
-                        # L/R update
-                        # ------------------------------------
-
-                        tcp.set_segment_rgb(
-                            left,
-                            right,
-                        )
-
-                # --------------------------------------------
-                # UDP keepalive
-                # --------------------------------------------
-
-                now = time.monotonic()
-
-                if (
-                    now
-                    - last_keepalive
-                    >= KEEPALIVE_INTERVAL
-                ):
-
-                    try:
-
-                        udp.keepalive()
-
-                    except Exception:
-                        pass
-
-                    last_keepalive = now
-
-                # --------------------------------------------
-                # FPS limiter
-                # --------------------------------------------
-
-                elapsed = (
-                    time.monotonic()
-                    - frame_start
-                )
-
-                sleep_time = (
-                    frame_time
-                    - elapsed
-                )
-
-                if sleep_time > 0:
-
-                    time.sleep(
-                        sleep_time
-                    )
-
+                delay = frame_time - cost
+                if delay > 0:
+                    time.sleep(delay)
     except KeyboardInterrupt:
-
-        print()
-        print(
-            "Stopping..."
-        )
-
-        # ----------------------------------------------------
-        # Only here do we completely turn background OFF.
-        # ----------------------------------------------------
-
-        try:
-
-            tcp.background_power(
-                "off"
-            )
-
-        except Exception:
-            pass
-
+        print("\nStopping...")
     finally:
-
-        tcp.close()
-        udp.close()
-
-        print(
-            "Done."
-        )
+        sender.shutdown()
+        print("Done.")
 
 
 if __name__ == "__main__":
