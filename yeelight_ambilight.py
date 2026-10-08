@@ -15,6 +15,7 @@ import colorsys
 import dataclasses
 import json
 import math
+import os
 import sys
 import threading
 import time
@@ -68,6 +69,12 @@ class Config:
     wake_threshold: float = 12.0
     dark_hold_s: float = 2.0          # darkness must last this long before power off
     wake_frames: int = 2
+
+    # the bar's front (desk) light is separate from the rear RGB light
+    main_light: str = "leave"        # leave | on | off  (applied once at start)
+
+    # diagnostics
+    poll_state: bool = False          # --debug: poll the lamp's real state every 2 s
 
 
 # ============================================================
@@ -148,6 +155,8 @@ class Pipeline:
         self.dark_since: Optional[float] = None
         self.wake_count = 0
         self.bright = cfg.bright_max
+        self.last_top = 0.0
+        self.last_sides = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
         self.out = Output(True, lan.rgb_to_int((255, 255, 255)), lan.rgb_to_int((255, 255, 255)),
                           cfg.bright_max)
 
@@ -168,6 +177,8 @@ class Pipeline:
         top = max(side_max)
         raw_luma = cfg.luma_mix * top + (1 - cfg.luma_mix) * (side_max[0] + side_max[1]) / 2
         dark = top <= cfg.black_threshold
+        self.last_top = top
+        self.last_sides = sides
 
         # --- power state with hysteresis ------------------------------
         if self.state == "active":
@@ -260,6 +271,8 @@ class Sender(threading.Thread):
         self.last_recover = 0.0
         self.frames = 0
         self.errors = 0
+        self.lamp_state = "-"
+        self.last_poll = 0.0
 
     def submit(self, out: Output) -> None:
         with self._lock:
@@ -297,6 +310,7 @@ class Sender(threading.Thread):
             if not self.conn.tcp.set_power(out.power):
                 raise ConnectionError("bg_set_power was not acknowledged")
             self.power_actual = out.power
+            print(f"[sender] bg_set_power {'on' if out.power else 'off'} acknowledged")
             self._force_resend()
 
         if self.power_actual:
@@ -316,6 +330,14 @@ class Sender(threading.Thread):
 
     def _housekeeping(self, now: float) -> None:
         udp = self.conn.udp
+        if self.cfg.poll_state and now - self.last_poll >= 2.0:
+            self.last_poll = now
+            reply = self.conn.tcp.call("get_prop", ["power", "bg_power", "bg_bright", "bg_rgb"],
+                                       timeout=0.5)
+            if reply and isinstance(reply.get("result"), list):
+                self.lamp_state = "/".join(str(v) for v in reply["result"])
+            else:
+                self.lamp_state = "no reply"
         if now - self.last_keepalive >= KEEPALIVE_INTERVAL:
             udp.keepalive()
             self.last_keepalive = now
@@ -367,8 +389,23 @@ def load_config(args: argparse.Namespace) -> Config:
     overrides = {
         "ip": args.ip, "monitor": args.monitor, "send_fps": args.send_fps,
         "capture_fps": args.capture_fps, "bright_max": args.bright_max,
+        "main_light": args.main_light,
     }
-    return dataclasses.replace(cfg, **{k: v for k, v in overrides.items() if v is not None})
+    cfg = dataclasses.replace(cfg, **{k: v for k, v in overrides.items() if v is not None})
+    if cfg.main_light not in ("leave", "on", "off"):
+        sys.exit("main_light must be leave, on or off")
+    return cfg
+
+
+def apply_main_light(conn: lan.Connection, mode: str) -> Optional[bool]:
+    """Switch the front (desk) light once. Returns None when nothing was requested."""
+    if mode not in ("on", "off"):
+        return None
+    try:
+        reply = conn.tcp.call("set_power", [mode, "sudden", 0], timeout=2.0)
+    except OSError:
+        return False
+    return bool(reply) and reply.get("result") == ["ok"]
 
 
 def main() -> None:
@@ -379,8 +416,12 @@ def main() -> None:
     parser.add_argument("--send-fps", type=int)
     parser.add_argument("--capture-fps", type=int)
     parser.add_argument("--bright-max", type=int)
+    parser.add_argument("--main-light", choices=["leave", "on", "off"],
+                        help="front (desk) light of the bar: leave (default), on or off; not restored on exit")
     parser.add_argument("--discover", action="store_true", help="list lamps and exit")
     parser.add_argument("--debug", action="store_true", help="print stats every 2 s")
+    parser.add_argument("--save-strip", metavar="PNG",
+                        help="save the captured strip every 2 s (overwritten) to see what the script sees")
     args = parser.parse_args()
 
     if args.discover:
@@ -389,7 +430,9 @@ def main() -> None:
         return
 
     cfg = load_config(args)
-    conn = lan.Connection(ip=cfg.ip, cache_path="lamp_cache.json")
+    cfg.poll_state = args.debug
+    cache_path = os.path.join(os.path.expanduser("~"), ".yeelight_ambilight_lamp.json")
+    conn = lan.Connection(ip=cfg.ip, cache_path=cache_path)
 
     print("=" * 55)
     print("Yeelight Ambilight v0.4")
@@ -403,16 +446,20 @@ def main() -> None:
           f"{conn.ip} id {conn.device_id or 'pinned by --ip'}")
     print(f"Capture {cfg.capture_fps} fps, lamp {cfg.send_fps} fps, "
           f"brightness {cfg.bright_min}-{cfg.bright_max}")
+    main_ok = apply_main_light(conn, cfg.main_light)
+    if main_ok is not None:
+        print(f"Front (desk) light -> {cfg.main_light}: {'ok' if main_ok else 'FAILED'}")
     print("Press Ctrl+C to stop.\n")
 
     import mss  # imported here so the logic above stays testable without a display
+    mss_class = getattr(mss, "MSS", None) or mss.mss
 
     sender = Sender(cfg, conn)
     pipeline = Pipeline(cfg)
     sender.start()
 
     try:
-        with mss.mss() as sct:
+        with mss_class() as sct:
             mon = sct.monitors[cfg.monitor]
             region = {
                 "left": mon["left"], "top": mon["top"], "width": mon["width"],
@@ -424,11 +471,20 @@ def main() -> None:
             stat_t = time.monotonic()
             stat_frames = 0
             stat_cost = 0.0
+            last_save = 0.0
 
             while True:
                 t0 = time.monotonic()
                 shot = sct.grab(region)
                 img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+                if args.save_strip and t0 - last_save >= 2.0:
+                    last_save = t0
+                    try:
+                        img.save(args.save_strip)
+                    except OSError as exc:
+                        print(f"[save-strip] cannot write {args.save_strip}: {exc}. "
+                              "Use a writable path, e.g. %TEMP%\\strip.png", file=sys.stderr)
+                        args.save_strip = None
                 left, right = analyze_strip(img, cfg.center_overlap)
                 out = pipeline.process(left, right, t0)
                 sender.submit(out)
@@ -439,8 +495,12 @@ def main() -> None:
                 if args.debug and t0 - stat_t >= 2.0:
                     span = t0 - stat_t
                     print(f"capture {stat_frames / span:5.1f} fps ({stat_cost / stat_frames * 1000:4.1f} ms/frame)"
-                          f" | lamp frames {sender.frames / span:5.1f}/s | bright {out.bright:3d}"
-                          f" | power {'on ' if out.power else 'off'} | errors {sender.errors}")
+                          f" | lamp {sender.frames / span:5.1f}/s | bright {out.bright:3d}"
+                          f" | power {'on ' if out.power else 'off'} | errors {sender.errors}"
+                          f" | {pipeline.state} top={pipeline.last_top:5.1f}"
+                          f" | lamp power/bg_power/bg_bright/bg_rgb={sender.lamp_state}"
+                          f" L={tuple(int(v) for v in pipeline.last_sides[0])}"
+                          f" R={tuple(int(v) for v in pipeline.last_sides[1])}")
                     stat_t, stat_frames, stat_cost = t0, 0, 0.0
                     sender.frames = 0
 
