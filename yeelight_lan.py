@@ -16,6 +16,15 @@ import socket
 import time
 from typing import Dict, List, Optional, Tuple
 
+TRACE = False  # set to True (--trace) to log every command and reply
+
+
+def trace(message: str) -> None:
+    if TRACE:
+        now = time.time()
+        print(f"[trace {time.strftime('%H:%M:%S', time.localtime(now))}.{int(now * 1000) % 1000:03d}] {message}")
+
+
 TCP_PORT = 55443
 UDP_PORT = 55444
 SSDP_ADDR = ("239.255.255.250", 1982)
@@ -165,13 +174,17 @@ class LampTCP:
                 self._connect()
             rid = self.next_id
             self.next_id += 1
+            t0 = time.monotonic()
             self.sock.sendall(_dumps({"id": rid, "method": method, "params": params}))
             deadline = time.monotonic() + (timeout or self.timeout)
             while True:
                 msg = self._read_message(deadline)
                 if msg is None:
+                    trace(f"TCP {method} {params} -> NO REPLY")
                     return None
                 if msg.get("id") == rid:
+                    ms = (time.monotonic() - t0) * 1000
+                    trace(f"TCP {method} {params} -> {json.dumps(msg, separators=(',', ':'))} ({ms:.0f} ms)")
                     return msg
         except OSError:
             self.close()
@@ -224,6 +237,7 @@ class LampUDP:
     def send(self, method: str, params: list) -> None:
         self.next_id += 1
         msg = {"id": self.next_id, "method": method, "params": params, "token": self.token}
+        trace(f"UDP {method} {params}")
         self.sock.sendto(_dumps(msg), (self.ip, UDP_PORT))
 
     def keepalive(self) -> None:
@@ -233,11 +247,13 @@ class LampUDP:
         """Read pending datagrams; any reply from the lamp counts as proof of life."""
         while True:
             try:
-                self.sock.recvfrom(4096)
+                data, _ = self.sock.recvfrom(4096)
             except (BlockingIOError, socket.timeout):
                 return
             except ConnectionResetError:
                 return  # Windows: ICMP port unreachable from an earlier send
+            text = re.sub(r'"token"\s*:\s*"[^"]*"', '"token":"..."', data.decode(errors="replace").strip())
+            trace(f"UDP reply {text}")
             self.last_alive = time.monotonic()
 
 

@@ -42,10 +42,14 @@ class Config:
     send_fps: int = 30                # lamp frames per second (UDP)
     bright_fps: int = 15              # max bg_set_bright updates per second
     refresh_s: float = 0.5            # resend unchanged state (packet-loss repair)
+    udp_gap_s: float = 0.02           # minimum time between two UDP datagrams
 
     center_overlap: float = 0.08      # L/R overlap around the middle
 
     # brightness (global, 1..100)
+    adaptive_brightness: bool = False  # EXPERIMENTAL: the lamp ignores bg_set_bright for ~1 s after every
+                                       # segment command, so it cannot follow the scene while streaming.
+                                       # False = fixed brightness (bright_max), set at start and on wake
     bright_min: int = 1
     bright_max: int = 60
     bright_gamma: float = 0.9
@@ -74,7 +78,7 @@ class Config:
     main_light: str = "leave"        # leave | on | off  (applied once at start)
 
     # diagnostics
-    poll_state: bool = False          # --debug: poll the lamp's real state every 2 s
+    poll_state: bool = False          # --debug: poll the lamp's real state every 5 s
 
 
 # ============================================================
@@ -154,6 +158,7 @@ class Pipeline:
         self.state = "active"          # active | off
         self.dark_since: Optional[float] = None
         self.wake_count = 0
+        self.side_dark = [False, False]
         self.bright = cfg.bright_max
         self.last_top = 0.0
         self.last_sides = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
@@ -198,6 +203,7 @@ class Pipeline:
                     self.dark_since = None
                     self.luma = None          # snap to the new scene
                     self.chroma = [None, None]
+                    self.side_dark = [True, True]
             else:
                 self.wake_count = 0
 
@@ -207,8 +213,18 @@ class Pipeline:
 
         # --- chroma per side ------------------------------------------
         for i in (0, 1):
+            # a dark side is shown as (0,0,0), which the lamp renders as no light; the lamp
+            # ignores color brightness otherwise, so this is the only way to darken one side
+            if self.side_dark[i]:
+                if side_max[i] > cfg.wake_threshold:
+                    self.side_dark[i] = False
+                    self.chroma[i] = None      # snap to the new color
+            elif side_max[i] <= cfg.black_threshold:
+                self.side_dark[i] = True
+            if self.side_dark[i]:
+                continue
             if side_max[i] < cfg.chroma_min:
-                continue                       # too dark: hold the last color
+                continue                       # too dark to trust its color: hold the last one
             target = normalize_chroma(sides[i], cfg.sat_boost)
             prev = self.chroma[i]
             if prev is None:
@@ -230,15 +246,18 @@ class Pipeline:
             tau = cfg.luma_tau_up if target_luma > self.luma else cfg.luma_tau_down
             self.luma = ema(self.luma, target_luma, dt, tau)
 
-        new_bright = self._map_bright(self.luma)
-        at_edge = new_bright in (cfg.bright_min, cfg.bright_max)
-        if at_edge or abs(new_bright - self.bright) >= cfg.bright_deadband:
-            self.bright = new_bright
+        if cfg.adaptive_brightness:
+            new_bright = self._map_bright(self.luma)
+            at_edge = new_bright in (cfg.bright_min, cfg.bright_max)
+            if at_edge or abs(new_bright - self.bright) >= cfg.bright_deadband:
+                self.bright = new_bright
+        else:
+            self.bright = cfg.bright_max
 
         self.out = Output(
             True,
-            lan.rgb_to_int(tuple(int(round(v)) for v in c_left)),
-            lan.rgb_to_int(tuple(int(round(v)) for v in c_right)),
+            0 if self.side_dark[0] else lan.rgb_to_int(tuple(int(round(v)) for v in c_left)),
+            0 if self.side_dark[1] else lan.rgb_to_int(tuple(int(round(v)) for v in c_right)),
             self.bright,
         )
         return self.out
@@ -269,6 +288,7 @@ class Sender(threading.Thread):
         self.last_bright_t = 0.0
         self.last_keepalive = 0.0
         self.last_recover = 0.0
+        self.last_udp = 0.0
         self.frames = 0
         self.errors = 0
         self.lamp_state = "-"
@@ -311,26 +331,36 @@ class Sender(threading.Thread):
                 raise ConnectionError("bg_set_power was not acknowledged")
             self.power_actual = out.power
             print(f"[sender] bg_set_power {'on' if out.power else 'off'} acknowledged")
+            if out.power:
+                # a UDP session opened before a power change may be dropped by the lamp
+                self.conn.udp.open()
+                self.last_keepalive = now
             self._force_resend()
 
-        if self.power_actual:
+        if self.power_actual and now - self.last_udp >= cfg.udp_gap_s:
             udp = self.conn.udp
             seg = (out.left, out.right)
-            if seg != self.last_seg or now - self.last_seg_t >= cfg.refresh_s:
-                udp.send("set_segment_rgb", [out.left, out.right])
-                self.last_seg, self.last_seg_t = seg, now
-                self.frames += 1
-            bright_due = now - self.last_bright_t >= 1.0 / cfg.bright_fps
-            if bright_due and (out.bright != self.last_bright
-                               or now - self.last_bright_t >= cfg.refresh_s):
+            seg_due = seg != self.last_seg or now - self.last_seg_t >= cfg.refresh_s
+            bright_due = (now - self.last_bright_t >= 1.0 / cfg.bright_fps
+                          and (out.bright != self.last_bright
+                               or (cfg.adaptive_brightness
+                                   and now - self.last_bright_t >= cfg.refresh_s)))
+            # one datagram per tick: the lamp may drop datagrams that arrive back to back
+            if bright_due:
                 udp.send("bg_set_bright", [out.bright, "sudden", 0])
                 self.last_bright, self.last_bright_t = out.bright, now
+                self.last_udp = now
+            elif seg_due:
+                udp.send("set_segment_rgb", [out.left, out.right])
+                self.last_seg, self.last_seg_t = seg, now
+                self.last_udp = now
+                self.frames += 1
 
         self._housekeeping(now)
 
     def _housekeeping(self, now: float) -> None:
         udp = self.conn.udp
-        if self.cfg.poll_state and now - self.last_poll >= 2.0:
+        if self.cfg.poll_state and now - self.last_poll >= 5.0:
             self.last_poll = now
             reply = self.conn.tcp.call("get_prop", ["power", "bg_power", "bg_bright", "bg_rgb"],
                                        timeout=0.5)
@@ -420,6 +450,7 @@ def main() -> None:
                         help="front (desk) light of the bar: leave (default), on or off; not restored on exit")
     parser.add_argument("--discover", action="store_true", help="list lamps and exit")
     parser.add_argument("--debug", action="store_true", help="print stats every 2 s")
+    parser.add_argument("--trace", action="store_true", help="log every command sent to the lamp and every reply (verbose)")
     parser.add_argument("--save-strip", metavar="PNG",
                         help="save the captured strip every 2 s (overwritten) to see what the script sees")
     args = parser.parse_args()
@@ -431,6 +462,7 @@ def main() -> None:
 
     cfg = load_config(args)
     cfg.poll_state = args.debug
+    lan.TRACE = args.trace
     cache_path = os.path.join(os.path.expanduser("~"), ".yeelight_ambilight_lamp.json")
     conn = lan.Connection(ip=cfg.ip, cache_path=cache_path)
 
@@ -444,8 +476,9 @@ def main() -> None:
     info = conn.info
     print(f"Lamp: {info.get('model', '?')} fw {info.get('fw_ver', '?')} "
           f"{conn.ip} id {conn.device_id or 'pinned by --ip'}")
-    print(f"Capture {cfg.capture_fps} fps, lamp {cfg.send_fps} fps, "
-          f"brightness {cfg.bright_min}-{cfg.bright_max}")
+    brightness = (f"{cfg.bright_min}-{cfg.bright_max} (adaptive, experimental)" if cfg.adaptive_brightness
+                  else f"{cfg.bright_max} (fixed)")
+    print(f"Capture {cfg.capture_fps} fps, lamp {cfg.send_fps} fps, brightness {brightness}")
     main_ok = apply_main_light(conn, cfg.main_light)
     if main_ok is not None:
         print(f"Front (desk) light -> {cfg.main_light}: {'ok' if main_ok else 'FAILED'}")

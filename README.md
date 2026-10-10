@@ -10,13 +10,12 @@ The program captures the top strip of your screen and mirrors its colors to the 
 
 * Left / right color zones (`set_segment_rgb`)
 * Automatic lamp discovery on the LAN, so no IP address has to be configured
-* Brightness follows the scene, color follows the picture (see [How it works](#how-it-works))
+* A dark half of the screen darkens that half of the light, and a fully dark screen switches the light off after a short hold
 * Adaptive smoothing: slow gradients stay smooth, hard scene cuts react immediately
-* Dark scene handling with hysteresis, so the light switches off only after sustained darkness
 * Real-time transport over the lamp's UDP session
 * Optional control of the bar's front (desk) light
 * Optional `config.json`
-* Built-in diagnostics (`--debug`, `--save-strip`) and a separate `probe.py` tool
+* Built-in diagnostics (`--debug`, `--trace`, `--save-strip`) and a separate `probe.py` measuring tool
 
 ## Requirements
 
@@ -90,7 +89,7 @@ Example start-up output:
 Yeelight Ambilight v0.4
 =======================================================
 Lamp: lamp15 fw 38 192.168.0.50 id 0x0000000012345678
-Capture 60 fps, lamp 30 fps, brightness 1-60
+Capture 60 fps, lamp 30 fps, brightness 60 (fixed)
 Press Ctrl+C to stop.
 
 Screen 3440x1440, strip 216 px
@@ -108,9 +107,10 @@ Press `Ctrl+C` to stop. On exit the rear light is switched off.
 | `--monitor N` | Monitor index to capture (`1` = primary) |
 | `--send-fps N` | Frames per second sent to the lamp (default 30) |
 | `--capture-fps N` | Screen capture rate (default 60) |
-| `--bright-max N` | Maximum brightness of the rear light, 1–100 (default 60) |
+| `--bright-max N` | Brightness of the rear light, 1–100 (default 60) |
 | `--main-light leave\|on\|off` | Front (desk) light: leave as is (default), switch on, or switch off at start |
 | `--debug` | Print statistics every 2 seconds (see [Diagnostics](#diagnostics)) |
+| `--trace` | Log every command sent to the lamp and every reply (very verbose) |
 | `--save-strip FILE` | Save the captured strip as an image every 2 seconds |
 
 ## Configuration
@@ -134,57 +134,64 @@ Command-line options override the file. Unknown keys stop the program with an er
 | `top_percent` | `0.15` | Share of the screen height used for sampling |
 | `capture_fps` | `60` | Screen capture rate |
 | `send_fps` | `30` | Lamp frame rate (UDP) |
-| `bright_fps` | `15` | Maximum brightness updates per second |
 | `refresh_s` | `0.5` | Unchanged state is re-sent this often, to repair lost UDP packets |
+| `udp_gap_s` | `0.02` | Minimum time between two UDP datagrams |
 | `center_overlap` | `0.08` | Overlap of the left and right zones around the middle |
-| `bright_min` | `1` | Lowest brightness while the lamp is on |
-| `bright_max` | `60` | Highest brightness |
-| `bright_gamma` | `0.9` | Curve from scene brightness to lamp brightness |
-| `bright_deadband` | `2` | Brightness changes smaller than this are ignored |
-| `luma_mix` | `0.5` | Scene brightness: `0` = mean of both sides, `1` = brighter side |
+| `bright_max` | `60` | Brightness of the rear light (see [How it works](#how-it-works)) |
 | `sat_boost` | `1.1` | Saturation boost of the sampled colors |
 | `chroma_min` | `10.0` | A side darker than this keeps its previous color |
 | `tau_slow` | `0.15` | Color smoothing time for slow changes, in seconds |
 | `tau_fast` | `0.02` | Color smoothing time for fast changes, in seconds |
 | `cut_distance` | `60.0` | Color change that counts as a fast scene |
+| `black_threshold` | `7.0` | A side at or below this brightness counts as black |
+| `wake_threshold` | `12.0` | A side above this brightness lights up again |
+| `dark_hold_s` | `2.0` | Both sides must stay black this long before the light is switched off |
+| `wake_frames` | `2` | Bright frames in a row needed to switch the light back on |
+| `main_light` | `"leave"` | Front light: `leave`, `on` or `off` (applied once at start, not restored on exit) |
+
+### Experimental: adaptive brightness
+
+Off by default, because the lamp does not allow it while colors are streaming (see below). These keys only have an effect with `"adaptive_brightness": true`:
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `adaptive_brightness` | `false` | Follow the scene brightness with `bg_set_bright` |
+| `bright_min` | `1` | Lowest brightness |
+| `bright_gamma` | `0.9` | Curve from scene brightness to lamp brightness |
+| `bright_deadband` | `2` | Brightness changes smaller than this are ignored |
+| `bright_fps` | `15` | Maximum brightness updates per second |
+| `luma_mix` | `0.5` | Scene brightness: `0` = mean of both sides, `1` = brighter side |
 | `luma_tau_up` | `0.04` | Smoothing time when the scene gets brighter |
 | `luma_tau_down` | `0.25` | Smoothing time when the scene gets darker |
 | `luma_cut` | `70.0` | Brightness jump that bypasses smoothing |
-| `black_threshold` | `7.0` | Scene brightness at or below this counts as black |
-| `wake_threshold` | `12.0` | Scene brightness above this wakes the light again |
-| `dark_hold_s` | `2.0` | Darkness must last this long before the light is switched off |
-| `wake_frames` | `2` | Bright frames in a row needed to switch the light back on |
-| `main_light` | `"leave"` | Front light: `leave`, `on` or `off` (applied once at start, not restored on exit) |
 
 ## How it works
 
 The bar has **two independent lights**: a rear RGB light and a front (desk) white light. This program drives the rear light only, and can switch the front one with `--main-light`.
 
-Measured on the lamp15, a segment color carries **hue and saturation only**: `0x010000` and `0xFF0000` both show full red, and gray shows as white. Brightness is a separate, global setting for the whole rear light. So each frame is split in two:
+What was measured on the lamp15 (firmware 38) shapes the whole design:
 
-1. **Chroma:** the average color of the left and right zone, normalized to full brightness, sent with `set_segment_rgb`.
-2. **Luma:** the brightness of the scene, mapped to the lamp's global brightness (`bg_set_bright`).
+* A segment color carries **hue and saturation only**. `0x010000` and `0xFF0000` both show full red, and gray shows as white. This holds over TCP and over UDP.
+* The one exception is `(0,0,0)`: that side goes dark (a very faint glow can remain). It works per side, so one half can be dark while the other is lit.
+* The rear light's brightness is a separate, global setting (`bg_set_bright`), but the lamp **ignores it for about one second after every segment command**. While colors stream continuously, brightness cannot change. So the brightness (`bright_max`) is set once at start and again when the light wakes up from darkness.
+* TCP commands are limited to about **60 per minute**, so colors cannot be streamed over TCP. The UDP session has no such limit and carries all frames. TCP is used only for power on and off.
 
-Both go to the lamp over a UDP session at up to 30 frames per second. TCP is used only for power on and off.
+So each frame is reduced to two colors: the average color of the left and the right zone, normalized to full value (with a slight saturation boost), or `(0,0,0)` for a zone that is black. They are sent with `set_segment_rgb` over UDP at up to 30 frames per second.
 
 Pipeline:
 
 ```text
 screen strip  ->  one resize to a 16x3 grid  ->  left / right zones
-   ->  chroma + luma  ->  time-based smoothing  ->  UDP sender thread  ->  lamp
+   ->  color + blackout per side  ->  time-based smoothing  ->  UDP sender thread  ->  lamp
 ```
 
 A single sender thread always sends the newest frame, so a slow network can drop frames but never builds up delay.
 
 ### Dark scenes
 
-The lamp cannot show true black through segment colors: a `(0,0,0)` segment still leaves a dim glow, even at the lowest brightness. So black is handled by power:
-
-* Dark scene: brightness drops to the minimum immediately and the last color is held.
-* After `dark_hold_s` seconds of darkness the rear light is switched off.
-* When the picture gets bright again the light switches back on.
-
-The lamp itself needs about a second to visibly switch on or off, although it acknowledges the command within a few milliseconds. The hold time prevents flicker on scenes that alternate quickly between dark and bright.
+* A side whose brightness falls to `black_threshold` or below is sent as `(0,0,0)`. It lights up again above `wake_threshold` (hysteresis, so it does not flicker).
+* When both sides stay black for `dark_hold_s` seconds, the rear light is switched off completely.
+* When the picture gets bright again the light switches back on. The lamp needs about a second to visibly switch on or off, although it acknowledges the command within a few milliseconds.
 
 ## Diagnostics
 
@@ -195,7 +202,7 @@ python yeelight_ambilight.py --debug
 Every 2 seconds one line is printed:
 
 ```text
-capture  59.0 fps (11.5 ms/frame) | lamp  24.0/s | bright  42 | power on  | errors 0 | active top=118.0 | lamp power/bg_power/bg_bright/bg_rgb=on/on/42/16711680 L=(201, 40, 30) R=(35, 180, 60)
+capture  59.0 fps (11.5 ms/frame) | lamp  24.0/s | bright  60 | power on  | errors 0 | active top=118.0 | lamp power/bg_power/bg_bright/bg_rgb=on/on/60/16711680 L=(201, 40, 30) R=(35, 180, 60)
 ```
 
 | Field | Meaning |
@@ -206,13 +213,13 @@ capture  59.0 fps (11.5 ms/frame) | lamp  24.0/s | bright  42 | power on  | erro
 | `errors` | Network errors in the sender |
 | `active` / `off` | State of the dark-scene logic |
 | `top`, `L`, `R` | Measured brightness of the strip and the average color of each side |
-| `lamp power/...` | What the lamp itself reports, queried over TCP. If it differs from what was commanded, something else is controlling the lamp |
+| `lamp power/...` | What the lamp itself reports, queried over TCP every 5 seconds. If it differs from what was commanded, something else is controlling the lamp |
 
-`--save-strip strip.png` writes the strip the program actually sees, which is useful to check what is captured (browser toolbars, wrong monitor, and so on).
+`--save-strip strip.png` writes the strip the program actually sees, which is useful to check what is captured (browser toolbars, wrong monitor, and so on). `--trace` prints every command and reply with timestamps.
 
 ### probe.py
 
-`probe.py` is a standalone tool (standard library only) for measuring how a lamp behaves. It does not touch the main program.
+`probe.py` is a standalone tool (standard library only) for measuring how a lamp behaves. It does not touch the main program. Many of its tests send TCP commands, so run them one at a time and, after a long TCP test, wait a minute (see the quota above).
 
 | Command | Purpose |
 | --- | --- |
@@ -224,8 +231,15 @@ capture  59.0 fps (11.5 ms/frame) | lamp  24.0/s | bright  42 | power on  | erro
 | `python probe.py dark` | Residual glow at different global brightness levels |
 | `python probe.py udp` | Which commands the lamp accepts over UDP |
 | `python probe.py udpfps --fps 30` | Sustained UDP rate (you watch the lamp) |
+| `python probe.py udpmag` | Whether UDP segment colors honour their brightness |
+| `python probe.py udpgap` | Whether brightness commands are applied right after a segment command |
+| `python probe.py lock` | How long brightness commands are ignored after a segment command |
+| `python probe.py segbright` | Which commands change brightness in segment mode |
+| `python probe.py segmix` | Brightness routes after segments were sent over UDP |
+| `python probe.py tcpsustain --fps 30` | A sustained TCP stream, to see the quota |
 | `python probe.py wake` | Acknowledge time of power off and on |
 | `python probe.py poweroff` | Power off behavior with TCP and with UDP in play |
+| `python probe.py maintest` | Rear light control after the front light was switched off |
 | `python probe.py chroma` | What `udp_chroma_sess_new` returns |
 | `python probe.py raw METHOD [PARAMS...]` | Send any single command, for example `raw set_power off sudden 0` |
 
@@ -239,7 +253,11 @@ Add `--ip ADDRESS` before the command to skip discovery. Session tokens printed 
 
 **The rear light stays lit or turns on by itself.** Close other programs that can control the lamp (the Yeelight app, Yeelight Station, Razer Synapse, Home Assistant) and compare with the `lamp power/...` field in `--debug`.
 
+**Commands are rejected with `client quota exceeded`.** The lamp accepts about 60 TCP commands per minute. Wait a minute. The main program uses TCP only for power changes (and, with `--debug`, a state query every 5 seconds).
+
 **Colors look white or washed out.** Gray and desaturated scenes show as white, because a segment color carries only hue and saturation. Raise `sat_boost` if you want more color.
+
+**The brightness does not follow the scene.** By design: the lamp ignores brightness commands while colors are streaming. Set the level you like with `bright_max`.
 
 **Capture is a wrong area.** Run with `--save-strip strip.png` and look at the image. Use `--monitor N` for another display.
 
@@ -247,7 +265,8 @@ Add `--ip ADDRESS` before the command to skip discovery. Session tokens printed 
 
 ## Limitations
 
-* Brightness is global for the whole rear light. When one side of the screen is dark and the other is bright, the dark side shows its color at the shared brightness.
+* The brightness of the rear light is fixed (`bright_max`); it cannot follow the scene while colors stream.
+* A half of the screen is either shown in full brightness or, when it is black, switched dark. There are no dim levels in between.
 * The lamp takes about a second to visibly switch on or off.
 * Only one monitor is captured at a time.
 * The format of the lamp's `udp_chroma_sess_new` session is undocumented and is not used.
@@ -265,10 +284,13 @@ Add `--ip ADDRESS` before the command to skip discovery. Session tokens printed 
 Measured on a real device; they may differ on other models or firmware.
 
 * Discovery: SSDP-style multicast to `239.255.255.250:1982`. The reply carries `id`, `model`, `fw_ver` and the supported methods.
-* TCP control on port 55443. Replies come as one JSON message per line, mixed with `props` notifications, so replies must be matched by `id`. A command takes about 17 ms to be acknowledged.
-* UDP on port 55444. A session is created with `udp_sess_new`, and the returned token is added to every command. Only `udp_sess_new` and `udp_sess_keep_alive` are answered. The keep-alive is sent about every 10 seconds, and at most four sessions exist at a time.
-* Accepted over UDP: `set_segment_rgb`, `bg_set_rgb`, `bg_set_bright`, `bg_set_power`.
-* `set_segment_rgb` takes two integers, `[left, right]`, as `0xRRGGBB`. Magnitude is ignored (hue and saturation only).
+* TCP control on port 55443. Replies come as one JSON message per line, mixed with `props` notifications, so replies must be matched by `id`. A command takes about 10–70 ms to be acknowledged.
+* **TCP quota:** about 60 commands per minute. After that the lamp answers `{"code":-1,"message":"client quota exceeded"}` to everything until the minute is over.
+* UDP on port 55444. A session is created with `udp_sess_new`, and the returned token is added to every command. Only `udp_sess_new` and `udp_sess_keep_alive` are answered. The keep-alive is sent about every 10 seconds, and at most four sessions exist at a time. No quota was observed at 30 frames per second.
+* Accepted over UDP: `set_segment_rgb`, `bg_set_rgb`, `bg_set_bright`, `bg_adjust_bright`, `bg_set_power`.
+* `set_segment_rgb` takes two integers, `[left, right]`, as `0xRRGGBB`. Magnitude is ignored (hue and saturation only), except `0`, which turns that side dark. Extra parameters `"sudden", 0` are accepted and change nothing.
+* After a segment command the lamp ignores brightness commands (`bg_set_bright`, TCP or UDP) for between 0.8 and 1.5 seconds. They are applied normally when no segment command was sent for about 1.5 seconds.
+* A UDP `bg_set_rgb` leaves segment mode (the whole rear light shows one color again). `bg_set_scene` with `"color"` sets color and brightness in one command (tested over TCP).
 * `bg_set_power` controls the rear light; `set_power` controls the front light. The `power` property looks like a combined flag that stays `on` while either light is on.
 * `udp_chroma_sess_new` works over UDP only (it returns a normal session token); over TCP it answers "method not supported". What it is used for is not documented.
 * The lamp has no `set_music` method.
@@ -289,7 +311,7 @@ The UDP session behavior is described in Yeelight's public *Inter-Operation Spec
 * [x] Improve left / right responsiveness
 * [ ] Reduce color transition latency (capture is about 12 ms per frame; end-to-end latency is not measured yet)
 * [ ] Better color sampling algorithm (grid sampling with zone overlap is done)
-* [ ] Adaptive dark-scene handling (implemented, final check pending)
+* [ ] Adaptive dark-scene handling (per-side blackout and power hold are implemented, final check pending)
 * [ ] Configurable color profiles
 
 ### v0.6
@@ -312,7 +334,7 @@ The UDP session behavior is described in Yeelight's public *Inter-Operation Spec
 * [ ] Taskbar (notification area) icon with a context menu
 * [ ] Ambilight on / off
 * [ ] Power on / off for each light separately: rear (RGB) and front (desk)
-* [ ] Brightness control for each light using the lamp's native brightness commands (rear: acts as the maximum brightness while ambilight is running)
+* [ ] Brightness control for each light using the lamp's native brightness commands (rear: the color stream has to pause for about 1.5 seconds while the new brightness is applied)
 * [ ] Automatic reconnect after signal loss (Wi-Fi drop, lamp reboot, new DHCP address) with a connection status indicator in the tray
 * [ ] Debug console window: live log (capture FPS, lamp frames/s, errors, real lamp state), copy and save log
 * [ ] GUI toolkit decision (TBD)
@@ -321,6 +343,7 @@ The UDP session behavior is described in Yeelight's public *Inter-Operation Spec
 
 * [x] UDP-based segment updates (`set_segment_rgb` works over the UDP session)
 * [x] Higher refresh rates (30 frames per second works; 60 not tested yet)
+* [ ] A way to change the rear light's brightness while colors stream (the lamp ignores brightness for about 1 second after each segment command)
 * [ ] Format of the undocumented `udp_chroma_sess_new` realtime session (idea: capture the official app's traffic)
 * [ ] Lower latency Ambilight mode
 * [ ] Hardware acceleration experiments
