@@ -4,7 +4,7 @@ Ambilight-style screen synchronization for the **Yeelight Monitor Light Bar Pro 
 
 The program captures the top strip of your screen and mirrors its colors to the rear RGB light of the bar: the left half of the screen drives the left half of the light, the right half drives the right half. Everything runs locally over your LAN, with no cloud and no account.
 
-> **Status: v0.4 (in testing).** Developed and tested on Windows 11 with a 3440×1440 monitor and a lamp15 on firmware 38. See [Tested setup](#tested-setup).
+> **Status: v0.4 (release candidate).** Everything planned for v0.4 is implemented; the automatic reconnect after an address change is the one item still waiting for a real-world check. Developed and tested on Windows 11 with a 3440×1440 monitor and a lamp15 on firmware 38. See [Tested setup](#tested-setup).
 
 ## Features
 
@@ -86,7 +86,7 @@ Example start-up output:
 
 ```text
 =======================================================
-Yeelight Ambilight v0.4
+Yeelight Ambilight v0.4 (r7 lock-aware power-off)
 =======================================================
 Lamp: lamp15 fw 38 192.168.0.50 id 0x0000000012345678
 Capture 60 fps, lamp 30 fps, brightness 60 (fixed)
@@ -136,6 +136,7 @@ Command-line options override the file. Unknown keys stop the program with an er
 | `send_fps` | `30` | Lamp frame rate (UDP) |
 | `refresh_s` | `0.5` | Unchanged state is re-sent this often, to repair lost UDP packets |
 | `udp_gap_s` | `0.02` | Minimum time between two UDP datagrams |
+| `lock_s` | `1.6` | Power-off waits this long after the last color frame, because the lamp ignores power commands for about a second after a frame |
 | `center_overlap` | `0.08` | Overlap of the left and right zones around the middle |
 | `bright_max` | `60` | Brightness of the rear light (see [How it works](#how-it-works)) |
 | `sat_boost` | `1.1` | Saturation boost of the sampled colors |
@@ -190,7 +191,8 @@ A single sender thread always sends the newest frame, so a slow network can drop
 ### Dark scenes
 
 * A side whose brightness falls to `black_threshold` or below is sent as `(0,0,0)`. It lights up again above `wake_threshold` (hysteresis, so it does not flicker).
-* When both sides stay black for `dark_hold_s` seconds, the rear light is switched off completely.
+* When both sides stay black for `dark_hold_s` seconds, the rear light is switched off completely. The lamp acknowledges a power command but ignores it for about a second after a color frame, so the program stops sending frames, waits `lock_s`, sends the command, and then asks the lamp whether it really switched off (it retries if not). Because of the wait, the light goes out roughly `dark_hold_s` seconds after the screen turns black.
+* On exit the program does the same, so the light is really off after `Ctrl+C` (this takes about two seconds).
 * When the picture gets bright again the light switches back on. The lamp needs about a second to visibly switch on or off, although it acknowledges the command within a few milliseconds.
 
 ## Diagnostics
@@ -251,6 +253,8 @@ Add `--ip ADDRESS` before the command to skip discovery. Session tokens printed 
 
 **A bright white light stays on when the screen is black.** That is the bar's front (desk) light, which the program does not control by default. Use `--main-light off`, or switch it off with the app or the button.
 
+**The rear light does not switch off on a black screen.** The lamp ignores power commands for about a second after a color frame. The program waits for this and verifies the result; if it still fails you will see `the lamp still reports bg_power=on` in the console, and `--trace` shows the exact commands.
+
 **The rear light stays lit or turns on by itself.** Close other programs that can control the lamp (the Yeelight app, Yeelight Station, Razer Synapse, Home Assistant) and compare with the `lamp power/...` field in `--debug`.
 
 **Commands are rejected with `client quota exceeded`.** The lamp accepts about 60 TCP commands per minute. Wait a minute. The main program uses TCP only for power changes (and, with `--debug`, a state query every 5 seconds).
@@ -277,7 +281,8 @@ Add `--ip ADDRESS` before the command to skip discovery. Session tokens printed 
 * Yeelight Monitor Light Bar Pro, model lamp15, firmware 38
 * Main program: Windows 11 Pro, 3440×1440 monitor at 144 Hz (capture about 59 fps, around 12 ms per frame)
 * `probe.py`: Windows 11 and macOS
-* The main program has not been verified on macOS or Linux yet
+* Verified on that setup: automatic discovery, left / right zones, slow and fast color changes, switching the light off after a black screen (the lamp confirms it) and back on, and switching off on exit
+* Not verified yet: one half of the screen black while the other is lit, reconnect after a real address change, end-to-end latency, and the main program on macOS or Linux
 
 ## Protocol notes (lamp15, firmware 38)
 
@@ -290,6 +295,7 @@ Measured on a real device; they may differ on other models or firmware.
 * Accepted over UDP: `set_segment_rgb`, `bg_set_rgb`, `bg_set_bright`, `bg_adjust_bright`, `bg_set_power`.
 * `set_segment_rgb` takes two integers, `[left, right]`, as `0xRRGGBB`. Magnitude is ignored (hue and saturation only), except `0`, which turns that side dark. Extra parameters `"sudden", 0` are accepted and change nothing.
 * After a segment command the lamp ignores brightness commands (`bg_set_bright`, TCP or UDP) for between 0.8 and 1.5 seconds. They are applied normally when no segment command was sent for about 1.5 seconds.
+* The same quiet period is needed for **power commands**: `bg_set_power off` sent right after a color frame is acknowledged (`ok`) but has no effect, and the lamp keeps reporting `bg_power: on`. Always check the result with `get_prop`.
 * A UDP `bg_set_rgb` leaves segment mode (the whole rear light shows one color again). `bg_set_scene` with `"color"` sets color and brightness in one command (tested over TCP).
 * `bg_set_power` controls the rear light; `set_power` controls the front light. The `power` property looks like a combined flag that stays `on` while either light is on.
 * `udp_chroma_sess_new` works over UDP only (it returns a normal session token); over TCP it answers "method not supported". What it is used for is not documented.
@@ -298,6 +304,8 @@ Measured on a real device; they may differ on other models or firmware.
 The UDP session behavior is described in Yeelight's public *Inter-Operation Specification (UDP)* in the `Yeelight/Yeelight-Chroma-Connector` repository.
 
 ## Roadmap
+
+Current version: **v0.4** (release candidate). Items of later versions that are already in the code are marked as done.
 
 ### v0.4
 
@@ -311,7 +319,8 @@ The UDP session behavior is described in Yeelight's public *Inter-Operation Spec
 * [x] Improve left / right responsiveness
 * [ ] Reduce color transition latency (capture is about 12 ms per frame; end-to-end latency is not measured yet)
 * [ ] Better color sampling algorithm (grid sampling with zone overlap is done)
-* [ ] Adaptive dark-scene handling (per-side blackout and power hold are implemented, final check pending)
+* [x] Dark-scene handling: the light switches off after sustained black and back on (verified on the lamp)
+* [ ] Per-side blackout when only one half of the screen is dark (implemented, not yet verified on the lamp)
 * [ ] Configurable color profiles
 
 ### v0.6

@@ -26,6 +26,8 @@ from PIL import Image
 
 import yeelight_lan as lan
 
+BUILD = "r7 lock-aware power-off"   # printed at start so you can tell which file is running
+
 RGBf = Tuple[float, float, float]
 
 
@@ -43,6 +45,8 @@ class Config:
     bright_fps: int = 15              # max bg_set_bright updates per second
     refresh_s: float = 0.5            # resend unchanged state (packet-loss repair)
     udp_gap_s: float = 0.02           # minimum time between two UDP datagrams
+    lock_s: float = 1.6               # the lamp ignores power/brightness commands for ~1 s after a
+                                      # segment command; power-off waits this long after the last frame
 
     center_overlap: float = 0.08      # L/R overlap around the middle
 
@@ -293,6 +297,8 @@ class Sender(threading.Thread):
         self.errors = 0
         self.lamp_state = "-"
         self.last_poll = 0.0
+        self.last_off_try = 0.0
+        self.off_tries = 0
 
     def submit(self, out: Output) -> None:
         with self._lock:
@@ -327,20 +333,25 @@ class Sender(threading.Thread):
             return
 
         if out.power != self.power_actual:
-            if not self.conn.tcp.set_power(out.power):
-                raise ConnectionError("bg_set_power was not acknowledged")
-            self.power_actual = out.power
-            print(f"[sender] bg_set_power {'on' if out.power else 'off'} acknowledged")
             if out.power:
+                if not self.conn.tcp.set_power(True):
+                    raise ConnectionError("bg_set_power was not acknowledged")
+                self.power_actual = True
+                self.off_tries = 0
+                print("[sender] bg_set_power on acknowledged")
                 # a UDP session opened before a power change may be dropped by the lamp
                 self.conn.udp.open()
                 self.last_keepalive = now
-            self._force_resend()
+                self._force_resend()
+            elif self._try_power_off(now):
+                self.power_actual = False
+                self._force_resend()
 
-        if self.power_actual and now - self.last_udp >= cfg.udp_gap_s:
+        if self.power_actual and out.power and now - self.last_udp >= cfg.udp_gap_s:
             udp = self.conn.udp
             seg = (out.left, out.right)
-            seg_due = seg != self.last_seg or now - self.last_seg_t >= cfg.refresh_s
+            black = out.left == 0 and out.right == 0
+            seg_due = seg != self.last_seg or (not black and now - self.last_seg_t >= cfg.refresh_s)
             bright_due = (now - self.last_bright_t >= 1.0 / cfg.bright_fps
                           and (out.bright != self.last_bright
                                or (cfg.adaptive_brightness
@@ -357,6 +368,38 @@ class Sender(threading.Thread):
                 self.frames += 1
 
         self._housekeeping(now)
+
+    def _try_power_off(self, now: float) -> bool:
+        """Switch the rear light off, the way the lamp allows it.
+
+        The lamp acknowledges a power command but ignores it for about a second after a
+        segment command. So wait until the stream has been quiet for lock_s, send the
+        command, then ask the lamp whether it really switched off.
+        """
+        cfg = self.cfg
+        if now - self.last_seg_t < cfg.lock_s or now - self.last_off_try < cfg.lock_s:
+            return False
+        self.last_off_try = now
+        if not self.conn.tcp.set_power(False):
+            raise ConnectionError("bg_set_power was not acknowledged")
+        return self._verify_off()
+
+    def _verify_off(self) -> bool:
+        reply = self.conn.tcp.call("get_prop", ["bg_power"], timeout=1.0)
+        result = reply.get("result") if reply else None
+        state = result[0] if isinstance(result, list) and result else None
+        if state == "off":
+            self.off_tries = 0
+            print("[sender] bg_set_power off acknowledged, the lamp confirms it is off")
+            return True
+        self.off_tries += 1
+        print(f"[sender] the lamp still reports bg_power={state} after off (try {self.off_tries})",
+              file=sys.stderr)
+        if self.off_tries >= 3:
+            print("[sender] giving up on switching the lamp off", file=sys.stderr)
+            self.off_tries = 0
+            return True
+        return False
 
     def _housekeeping(self, now: float) -> None:
         udp = self.conn.udp
@@ -396,7 +439,14 @@ class Sender(threading.Thread):
         self.stop_event.set()
         self.join(timeout=2.0)
         try:
-            self.conn.tcp.set_power(False)
+            if self.power_actual is not False:
+                for _ in range(3):
+                    wait = self.cfg.lock_s - (time.monotonic() - self.last_seg_t)
+                    if wait > 0:
+                        time.sleep(wait)       # the lamp ignores power commands right after a frame
+                    if self.conn.tcp.set_power(False) and self._verify_off():
+                        break
+                    time.sleep(self.cfg.lock_s)
         except (OSError, AttributeError):
             pass
         self.conn.close()
@@ -467,7 +517,7 @@ def main() -> None:
     conn = lan.Connection(ip=cfg.ip, cache_path=cache_path)
 
     print("=" * 55)
-    print("Yeelight Ambilight v0.4")
+    print(f"Yeelight Ambilight v0.4 ({BUILD})")
     print("=" * 55)
     try:
         conn.open()
@@ -543,6 +593,7 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nStopping...")
     finally:
+        print("Switching the lamp off...")
         sender.shutdown()
         print("Done.")
 
