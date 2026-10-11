@@ -26,7 +26,8 @@ from PIL import Image
 
 import yeelight_lan as lan
 
-BUILD = "r7 lock-aware power-off"   # printed at start so you can tell which file is running
+VERSION = "0.5.0-dev"
+BUILD = "r10 lock 1.3 s"   # printed at start so you can tell which file is running
 
 RGBf = Tuple[float, float, float]
 
@@ -45,7 +46,7 @@ class Config:
     bright_fps: int = 15              # max bg_set_bright updates per second
     refresh_s: float = 0.5            # resend unchanged state (packet-loss repair)
     udp_gap_s: float = 0.02           # minimum time between two UDP datagrams
-    lock_s: float = 1.6               # the lamp ignores power/brightness commands for ~1 s after a
+    lock_s: float = 1.3               # the lamp ignores power/brightness commands for ~1.05 s after a
                                       # segment command; power-off waits this long after the last frame
 
     center_overlap: float = 0.08      # L/R overlap around the middle
@@ -74,6 +75,8 @@ class Config:
 
     # dark scenes
     black_threshold: float = 7.0
+    min_lit_fraction: float = 0.2     # a side with less than this share of lit columns counts as dark
+    lit_hysteresis: float = 0.1       # ...and needs this much more to light up again
     wake_threshold: float = 12.0
     dark_hold_s: float = 2.0          # darkness must last this long before power off
     wake_frames: int = 2
@@ -89,12 +92,24 @@ class Config:
 # Screen analysis
 # ============================================================
 
-GRID_COLS = 16
+GRID_COLS = 64
 GRID_ROWS = 3
 
 
-def analyze_strip(img: Image.Image, overlap: float) -> Tuple[RGBf, RGBf]:
-    """Average color of the left and right part of a strip, using one BOX resize."""
+@dataclass
+class Zones:
+    left: "RGBf"
+    right: "RGBf"
+    lit_left: float     # share of the zone's columns that are not black, 0..1
+    lit_right: float
+
+
+def analyze_zones(img: Image.Image, overlap: float, lit_threshold: float = 12.0) -> Zones:
+    """Average color and lit share of the left and right zone, using one BOX resize.
+
+    The zones meet at the center of the captured monitor and overlap by `overlap`
+    (a share of the width). 64 columns keep that overlap close to the configured value.
+    """
     small = img.resize((GRID_COLS, GRID_ROWS), Image.Resampling.BOX)
     data = small.tobytes()
 
@@ -110,6 +125,7 @@ def analyze_strip(img: Image.Image, overlap: float) -> Tuple[RGBf, RGBf]:
 
     half = GRID_COLS // 2
     ov = max(0, round(GRID_COLS * overlap / 2))
+    left_cols, right_cols = cols[: half + ov], cols[half - ov:]
 
     def mean(part):
         n = len(part)
@@ -117,7 +133,16 @@ def analyze_strip(img: Image.Image, overlap: float) -> Tuple[RGBf, RGBf]:
                 sum(p[1] for p in part) / n,
                 sum(p[2] for p in part) / n)
 
-    return mean(cols[: half + ov]), mean(cols[half - ov:])
+    def lit(part):
+        return sum(1 for p in part if max(p) > lit_threshold) / len(part)
+
+    return Zones(mean(left_cols), mean(right_cols), lit(left_cols), lit(right_cols))
+
+
+def analyze_strip(img: Image.Image, overlap: float) -> Tuple["RGBf", "RGBf"]:
+    """Average colors only (kept for simple callers and tests)."""
+    zones = analyze_zones(img, overlap)
+    return zones.left, zones.right
 
 
 # ============================================================
@@ -151,6 +176,7 @@ class Output:
     left: int
     right: int
     bright: int
+    t: float = 0.0        # time.monotonic() at the start of the screen grab
 
 
 class Pipeline:
@@ -165,6 +191,7 @@ class Pipeline:
         self.side_dark = [False, False]
         self.bright = cfg.bright_max
         self.last_top = 0.0
+        self.last_lit = (1.0, 1.0)
         self.last_sides = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
         self.out = Output(True, lan.rgb_to_int((255, 255, 255)), lan.rgb_to_int((255, 255, 255)),
                           cfg.bright_max)
@@ -176,7 +203,8 @@ class Pipeline:
         x = clamp(luma / 255.0, 0.0, 1.0) ** cfg.bright_gamma
         return int(round(cfg.bright_min + (cfg.bright_max - cfg.bright_min) * x))
 
-    def process(self, left: RGBf, right: RGBf, now: float) -> Output:
+    def process(self, left: RGBf, right: RGBf, now: float,
+                lit: Tuple[float, float] = (1.0, 1.0)) -> Output:
         cfg = self.cfg
         dt = 1 / 60 if self.last_t is None else clamp(now - self.last_t, 0.001, 0.25)
         self.last_t = now
@@ -185,8 +213,14 @@ class Pipeline:
         side_max = [max(s) for s in sides]
         top = max(side_max)
         raw_luma = cfg.luma_mix * top + (1 - cfg.luma_mix) * (side_max[0] + side_max[1]) / 2
-        dark = top <= cfg.black_threshold
+        # A side is dark when it is black, or when only a small part of it is lit. The lamp cannot
+        # dim a color, so a thin lit sliver must not light a whole side at full brightness.
+        inst_dark = [side_max[i] <= cfg.black_threshold or lit[i] < cfg.min_lit_fraction
+                     for i in (0, 1)]
+        dark = all(inst_dark)
+        wake_level = cfg.min_lit_fraction + cfg.lit_hysteresis
         self.last_top = top
+        self.last_lit = lit
         self.last_sides = sides
 
         # --- power state with hysteresis ------------------------------
@@ -200,7 +234,7 @@ class Pipeline:
             else:
                 self.dark_since = None
         else:
-            if top > cfg.wake_threshold:
+            if any(side_max[i] > cfg.wake_threshold and lit[i] >= wake_level for i in (0, 1)):
                 self.wake_count += 1
                 if self.wake_count >= cfg.wake_frames:
                     self.state = "active"
@@ -212,7 +246,7 @@ class Pipeline:
                 self.wake_count = 0
 
         if self.state == "off":
-            self.out = Output(False, self.out.left, self.out.right, self.out.bright)
+            self.out = Output(False, self.out.left, self.out.right, self.out.bright, now)
             return self.out
 
         # --- chroma per side ------------------------------------------
@@ -220,10 +254,10 @@ class Pipeline:
             # a dark side is shown as (0,0,0), which the lamp renders as no light; the lamp
             # ignores color brightness otherwise, so this is the only way to darken one side
             if self.side_dark[i]:
-                if side_max[i] > cfg.wake_threshold:
+                if side_max[i] > cfg.wake_threshold and lit[i] >= wake_level:
                     self.side_dark[i] = False
                     self.chroma[i] = None      # snap to the new color
-            elif side_max[i] <= cfg.black_threshold:
+            elif inst_dark[i]:
                 self.side_dark[i] = True
             if self.side_dark[i]:
                 continue
@@ -263,6 +297,7 @@ class Pipeline:
             0 if self.side_dark[0] else lan.rgb_to_int(tuple(int(round(v)) for v in c_left)),
             0 if self.side_dark[1] else lan.rgb_to_int(tuple(int(round(v)) for v in c_right)),
             self.bright,
+            now,
         )
         return self.out
 
@@ -299,6 +334,15 @@ class Sender(threading.Thread):
         self.last_poll = 0.0
         self.last_off_try = 0.0
         self.off_tries = 0
+        self._lat_sum = 0.0
+        self._lat_n = 0
+        self._lat_max = 0.0
+
+    def take_latency(self) -> Tuple[float, float]:
+        """Average and maximum software latency (ms) of changed frames since the last call."""
+        n, total, worst = self._lat_n, self._lat_sum, self._lat_max
+        self._lat_sum, self._lat_n, self._lat_max = 0.0, 0, 0.0
+        return (total / n * 1000 if n else 0.0, worst * 1000)
 
     def submit(self, out: Output) -> None:
         with self._lock:
@@ -362,7 +406,13 @@ class Sender(threading.Thread):
                 self.last_bright, self.last_bright_t = out.bright, now
                 self.last_udp = now
             elif seg_due:
+                fresh = seg != self.last_seg
                 udp.send("set_segment_rgb", [out.left, out.right])
+                if fresh and out.t:
+                    lat = time.monotonic() - out.t
+                    self._lat_sum += lat
+                    self._lat_n += 1
+                    self._lat_max = max(self._lat_max, lat)
                 self.last_seg, self.last_seg_t = seg, now
                 self.last_udp = now
                 self.frames += 1
@@ -517,7 +567,7 @@ def main() -> None:
     conn = lan.Connection(ip=cfg.ip, cache_path=cache_path)
 
     print("=" * 55)
-    print(f"Yeelight Ambilight v0.4 ({BUILD})")
+    print(f"Yeelight Ambilight {VERSION} ({BUILD})")
     print("=" * 55)
     try:
         conn.open()
@@ -568,8 +618,8 @@ def main() -> None:
                         print(f"[save-strip] cannot write {args.save_strip}: {exc}. "
                               "Use a writable path, e.g. %TEMP%\\strip.png", file=sys.stderr)
                         args.save_strip = None
-                left, right = analyze_strip(img, cfg.center_overlap)
-                out = pipeline.process(left, right, t0)
+                zones = analyze_zones(img, cfg.center_overlap, cfg.wake_threshold)
+                out = pipeline.process(zones.left, zones.right, t0, (zones.lit_left, zones.lit_right))
                 sender.submit(out)
 
                 cost = time.monotonic() - t0
@@ -577,11 +627,14 @@ def main() -> None:
                 stat_cost += cost
                 if args.debug and t0 - stat_t >= 2.0:
                     span = t0 - stat_t
+                    sw_avg, sw_max = sender.take_latency()
                     print(f"capture {stat_frames / span:5.1f} fps ({stat_cost / stat_frames * 1000:4.1f} ms/frame)"
-                          f" | lamp {sender.frames / span:5.1f}/s | bright {out.bright:3d}"
+                          f" | lamp {sender.frames / span:5.1f}/s | sw {sw_avg:3.0f}/{sw_max:3.0f} ms"
+                          f" | bright {out.bright:3d}"
                           f" | power {'on ' if out.power else 'off'} | errors {sender.errors}"
                           f" | {pipeline.state} top={pipeline.last_top:5.1f}"
                           f" | lamp power/bg_power/bg_bright/bg_rgb={sender.lamp_state}"
+                          f" lit={pipeline.last_lit[0] * 100:.0f}%/{pipeline.last_lit[1] * 100:.0f}%"
                           f" L={tuple(int(v) for v in pipeline.last_sides[0])}"
                           f" R={tuple(int(v) for v in pipeline.last_sides[1])}")
                     stat_t, stat_frames, stat_cost = t0, 0, 0.0

@@ -4,7 +4,7 @@ Ambilight-style screen synchronization for the **Yeelight Monitor Light Bar Pro 
 
 The program captures the top strip of your screen and mirrors its colors to the rear RGB light of the bar: the left half of the screen drives the left half of the light, the right half drives the right half. Everything runs locally over your LAN, with no cloud and no account.
 
-> **Status: v0.4 (release candidate).** Everything planned for v0.4 is implemented; the automatic reconnect after an address change is the one item still waiting for a real-world check. Developed and tested on Windows 11 with a 3440×1440 monitor and a lamp15 on firmware 38. See [Tested setup](#tested-setup).
+> **Status: 0.5.0 (in development).** The planned v0.4 and v0.5 work is in the code and will ship together as 0.5.0. Still to check on a real setup: one dark half of the screen and the end-to-end latency. The automatic reconnect after an address change is implemented, but its real-world check is postponed to v0.7. Developed and tested on Windows 11 with a 3440×1440 monitor and a lamp15 on firmware 38. See [Tested setup](#tested-setup).
 
 ## Features
 
@@ -54,7 +54,7 @@ Keep the project in a folder you can write to (for example under your user direc
 
 ## Finding the lamp
 
-There is nothing to configure. On start the program searches the LAN for Yeelight devices (SSDP multicast on every network interface), picks the lamp15, and remembers its device `id` in `~/.yeelight_ambilight_lamp.json`. If the lamp later gets a new IP address from DHCP, it is found again by that `id`.
+There is nothing to configure. On start the program searches the LAN for Yeelight devices (SSDP multicast on every network interface), picks the lamp15, and remembers its device `id` in `~/.yeelight_ambilight_lamp.json`. If the lamp later gets a new IP address from DHCP, it is meant to be found again by that `id` (implemented, but not yet verified on a real address change).
 
 List what is visible on your network:
 
@@ -86,7 +86,7 @@ Example start-up output:
 
 ```text
 =======================================================
-Yeelight Ambilight v0.4 (r7 lock-aware power-off)
+Yeelight Ambilight 0.5.0-dev (r10 lock 1.3 s)
 =======================================================
 Lamp: lamp15 fw 38 192.168.0.50 id 0x0000000012345678
 Capture 60 fps, lamp 30 fps, brightness 60 (fixed)
@@ -136,8 +136,8 @@ Command-line options override the file. Unknown keys stop the program with an er
 | `send_fps` | `30` | Lamp frame rate (UDP) |
 | `refresh_s` | `0.5` | Unchanged state is re-sent this often, to repair lost UDP packets |
 | `udp_gap_s` | `0.02` | Minimum time between two UDP datagrams |
-| `lock_s` | `1.6` | Power-off waits this long after the last color frame, because the lamp ignores power commands for about a second after a frame |
-| `center_overlap` | `0.08` | Overlap of the left and right zones around the middle |
+| `lock_s` | `1.3` | Power-off waits this long after the last color frame, because the lamp ignores power and brightness commands for about a second (1.05 s measured) after a frame |
+| `center_overlap` | `0.08` | The zones meet at the center of the captured monitor and overlap by this share of the width. `0` gives a hard split |
 | `bright_max` | `60` | Brightness of the rear light (see [How it works](#how-it-works)) |
 | `sat_boost` | `1.1` | Saturation boost of the sampled colors |
 | `chroma_min` | `10.0` | A side darker than this keeps its previous color |
@@ -145,6 +145,8 @@ Command-line options override the file. Unknown keys stop the program with an er
 | `tau_fast` | `0.02` | Color smoothing time for fast changes, in seconds |
 | `cut_distance` | `60.0` | Color change that counts as a fast scene |
 | `black_threshold` | `7.0` | A side at or below this brightness counts as black |
+| `min_lit_fraction` | `0.2` | A side with less than this share of lit columns counts as dark, even if its average is not black |
+| `lit_hysteresis` | `0.1` | A dark side needs this much more than `min_lit_fraction` to light up again |
 | `wake_threshold` | `12.0` | A side above this brightness lights up again |
 | `dark_hold_s` | `2.0` | Both sides must stay black this long before the light is switched off |
 | `wake_frames` | `2` | Bright frames in a row needed to switch the light back on |
@@ -182,7 +184,7 @@ So each frame is reduced to two colors: the average color of the left and the ri
 Pipeline:
 
 ```text
-screen strip  ->  one resize to a 16x3 grid  ->  left / right zones
+screen strip  ->  one resize to a 64x3 grid  ->  left / right zones (split at the monitor center)
    ->  color + blackout per side  ->  time-based smoothing  ->  UDP sender thread  ->  lamp
 ```
 
@@ -190,7 +192,8 @@ A single sender thread always sends the newest frame, so a slow network can drop
 
 ### Dark scenes
 
-* A side whose brightness falls to `black_threshold` or below is sent as `(0,0,0)`. It lights up again above `wake_threshold` (hysteresis, so it does not flicker).
+* A side is sent as `(0,0,0)` when it is black (its average brightness is at or below `black_threshold`) **or** when only a small part of it is lit (less than `min_lit_fraction` of its width). The second rule matters because the lamp cannot dim a color: without it, a thin bright strip next to a black half would light the whole half at full brightness. A side lights up again only when clearly lit (above `wake_threshold` and `min_lit_fraction` + `lit_hysteresis`), so it does not flicker.
+* A dark side is not completely off: `(0,0,0)` leaves a faint glow. Only switching the whole light off makes it fully dark.
 * When both sides stay black for `dark_hold_s` seconds, the rear light is switched off completely. The lamp acknowledges a power command but ignores it for about a second after a color frame, so the program stops sending frames, waits `lock_s`, sends the command, and then asks the lamp whether it really switched off (it retries if not). Because of the wait, the light goes out roughly `dark_hold_s` seconds after the screen turns black.
 * On exit the program does the same, so the light is really off after `Ctrl+C` (this takes about two seconds).
 * When the picture gets bright again the light switches back on. The lamp needs about a second to visibly switch on or off, although it acknowledges the command within a few milliseconds.
@@ -204,20 +207,32 @@ python yeelight_ambilight.py --debug
 Every 2 seconds one line is printed:
 
 ```text
-capture  59.0 fps (11.5 ms/frame) | lamp  24.0/s | bright  60 | power on  | errors 0 | active top=118.0 | lamp power/bg_power/bg_bright/bg_rgb=on/on/60/16711680 L=(201, 40, 30) R=(35, 180, 60)
+capture  59.0 fps (11.5 ms/frame) | lamp  24.0/s | sw  18/ 35 ms | bright  60 | power on  | errors 0 | active top=118.0 | lamp power/bg_power/bg_bright/bg_rgb=on/on/60/16711680 lit=100%/85% L=(201, 40, 30) R=(35, 180, 60)
 ```
 
 | Field | Meaning |
 | --- | --- |
 | `capture` | Capture rate and time per frame |
 | `lamp` | Frames per second actually sent to the lamp |
+| `sw` | Software latency in milliseconds, average / maximum over the last 2 seconds: from the start of the screen grab to the moment the changed frame is handed to the network |
 | `bright`, `power` | What the program is commanding |
 | `errors` | Network errors in the sender |
 | `active` / `off` | State of the dark-scene logic |
 | `top`, `L`, `R` | Measured brightness of the strip and the average color of each side |
+| `lit` | Share of each side's width that is not black (left / right) |
 | `lamp power/...` | What the lamp itself reports, queried over TCP every 5 seconds. If it differs from what was commanded, something else is controlling the lamp |
 
 `--save-strip strip.png` writes the strip the program actually sees, which is useful to check what is captured (browser toolbars, wrong monitor, and so on). `--trace` prints every command and reply with timestamps.
+
+### Measuring latency
+
+`sw` in the debug line covers only the computer: screen grab, analysis, and the sender. The full path also includes Wi-Fi, the lamp itself, and the monitor. To measure the total, use `latency_flash.py` and a phone camera:
+
+1. Start the program: `python yeelight_ambilight.py --debug`.
+2. Start the flasher: `python latency_flash.py`. It fills the screen with red and blue, alternating every 2 seconds (`--interval` changes this), and `Esc` quits. Red and blue are used so the lamp never switches off.
+3. Film in slow motion (240 fps if possible, at least 120 fps) with the top edge of the screen and the lamp's rear glow in the same shot.
+4. Step through the video frame by frame and count the frames between the screen changing and the lamp following. Latency = frames / camera fps.
+5. Repeat for 10 or more changes and take the median.
 
 ### probe.py
 
@@ -235,7 +250,8 @@ capture  59.0 fps (11.5 ms/frame) | lamp  24.0/s | bright  60 | power on  | erro
 | `python probe.py udpfps --fps 30` | Sustained UDP rate (you watch the lamp) |
 | `python probe.py udpmag` | Whether UDP segment colors honour their brightness |
 | `python probe.py udpgap` | Whether brightness commands are applied right after a segment command |
-| `python probe.py lock` | How long brightness commands are ignored after a segment command |
+| `python probe.py lock [--gaps 900,1100,1300]` | How long brightness commands are ignored after a segment command (choose the gaps to narrow it down) |
+| `python probe.py frontlock` | Whether the front light's brightness is also ignored right after a segment command |
 | `python probe.py segbright` | Which commands change brightness in segment mode |
 | `python probe.py segmix` | Brightness routes after segments were sent over UDP |
 | `python probe.py tcpsustain --fps 30` | A sustained TCP stream, to see the quota |
@@ -282,7 +298,7 @@ Add `--ip ADDRESS` before the command to skip discovery. Session tokens printed 
 * Main program: Windows 11 Pro, 3440×1440 monitor at 144 Hz (capture about 59 fps, around 12 ms per frame)
 * `probe.py`: Windows 11 and macOS
 * Verified on that setup: automatic discovery, left / right zones, slow and fast color changes, switching the light off after a black screen (the lamp confirms it) and back on, and switching off on exit
-* Not verified yet: one half of the screen black while the other is lit, reconnect after a real address change, end-to-end latency, and the main program on macOS or Linux
+* Not verified yet: one half of the screen black while the other is lit, end-to-end latency, reconnect after a real address change (postponed to v0.7), and the main program on macOS or Linux
 
 ## Protocol notes (lamp15, firmware 38)
 
@@ -294,7 +310,7 @@ Measured on a real device; they may differ on other models or firmware.
 * UDP on port 55444. A session is created with `udp_sess_new`, and the returned token is added to every command. Only `udp_sess_new` and `udp_sess_keep_alive` are answered. The keep-alive is sent about every 10 seconds, and at most four sessions exist at a time. No quota was observed at 30 frames per second.
 * Accepted over UDP: `set_segment_rgb`, `bg_set_rgb`, `bg_set_bright`, `bg_adjust_bright`, `bg_set_power`.
 * `set_segment_rgb` takes two integers, `[left, right]`, as `0xRRGGBB`. Magnitude is ignored (hue and saturation only), except `0`, which turns that side dark. Extra parameters `"sudden", 0` are accepted and change nothing.
-* After a segment command the lamp ignores brightness commands (`bg_set_bright`, TCP or UDP) for between 0.8 and 1.5 seconds. They are applied normally when no segment command was sent for about 1.5 seconds.
+* After a segment command the lamp ignores brightness commands (`bg_set_bright`, TCP or UDP) for about one second: ignored at 0.9 s, sometimes applied at 1.0 s, always applied from 1.1 s. The front light's `set_bright` is ignored in the same way.
 * The same quiet period is needed for **power commands**: `bg_set_power off` sent right after a color frame is acknowledged (`ok`) but has no effect, and the lamp keeps reporting `bg_power: on`. Always check the result with `get_prop`.
 * A UDP `bg_set_rgb` leaves segment mode (the whole rear light shows one color again). `bg_set_scene` with `"color"` sets color and brightness in one command (tested over TCP).
 * `bg_set_power` controls the rear light; `set_power` controls the front light. The `power` property looks like a combined flag that stays `on` while either light is on.
@@ -305,37 +321,37 @@ The UDP session behavior is described in Yeelight's public *Inter-Operation Spec
 
 ## Roadmap
 
-Current version: **v0.4** (release candidate). Items of later versions that are already in the code are marked as done.
+Current version: **0.5.0-dev**. The v0.4 and v0.5 items below ship together as release 0.5.0.
 
 ### v0.4
 
 * [x] Automatic Yeelight discovery (LAN multicast)
 * [x] Remove the hardcoded device IP requirement
-* [ ] Automatic reconnection after DHCP IP changes (implemented, not yet verified on a real address change)
 * [x] Device information logging (model, firmware, IP)
 
 ### v0.5
 
 * [x] Improve left / right responsiveness
-* [ ] Reduce color transition latency (capture is about 12 ms per frame; end-to-end latency is not measured yet)
+* [ ] Reduce color transition latency (capture is about 12 ms per frame and `--debug` shows the software latency; the end-to-end value still has to be measured with `latency_flash.py`)
 * [ ] Better color sampling algorithm (grid sampling with zone overlap is done)
 * [x] Dark-scene handling: the light switches off after sustained black and back on (verified on the lamp)
-* [ ] Per-side blackout when only one half of the screen is dark (implemented, not yet verified on the lamp)
-* [ ] Configurable color profiles
+* [ ] Per-side blackout when only one half of the screen is dark (implemented, lit-fraction rule added after a first test; recheck on the lamp)
 
 ### v0.6
 
 * [x] Config file (`config.json`)
+* [ ] Configurable color profiles
 * [ ] Multi-monitor support (a single monitor can be selected with `--monitor`)
 * [ ] Device selection when multiple Yeelight devices are detected
-* [ ] Per-monitor lighting zones
+* [ ] Per-monitor lighting zones (zone boundaries relative to each monitor's own center, and the position of the light bar)
 
 ### v0.7
 
 * [ ] Native Windows executable
 * [ ] System tray integration
 * [ ] Auto-start with Windows
-* [ ] Background service mode
+* [ ] Background mode: start at Windows login, no console window (a real Windows service cannot capture the screen)
+* [ ] Automatic reconnection after DHCP IP changes (moved from v0.4: implemented in the engine, a real address change still has to be tried; the tray shows the connection status)
 
 #### Tray application (minimal GUI)
 
@@ -343,10 +359,10 @@ Current version: **v0.4** (release candidate). Items of later versions that are 
 * [ ] Taskbar (notification area) icon with a context menu
 * [ ] Ambilight on / off
 * [ ] Power on / off for each light separately: rear (RGB) and front (desk)
-* [ ] Brightness control for each light using the lamp's native brightness commands (rear: the color stream has to pause for about 1.5 seconds while the new brightness is applied)
+* [ ] Brightness sliders for the rear and the front light in a small popup window opened from the tray (the tray menu itself cannot hold a slider). The value is applied when the slider is released; the color stream pauses for about a second and a half while the lamp accepts the new brightness (the lamp ignores brightness changes of both lights right after a color frame)
 * [ ] Automatic reconnect after signal loss (Wi-Fi drop, lamp reboot, new DHCP address) with a connection status indicator in the tray
 * [ ] Debug console window: live log (capture FPS, lamp frames/s, errors, real lamp state), copy and save log
-* [ ] GUI toolkit decision (TBD)
+* [ ] GUI toolkit decision (candidate: `pystray` for the tray icon and `tkinter` for the popup and console windows)
 
 ### Research
 
