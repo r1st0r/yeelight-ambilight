@@ -15,7 +15,19 @@ The program captures the top strip of your screen and mirrors its colors to the 
 * Real-time transport over the lamp's UDP session
 * Optional control of the bar's front (desk) light
 * Optional `config.json`
+* Tray application (preview, Windows): an icon in the notification area with Ambilight on/off, front light on/off, start with Windows
 * Built-in diagnostics (`--debug`, `--trace`, `--save-strip`) and a separate `probe.py` measuring tool
+
+## Project files
+
+| File | Purpose |
+| --- | --- |
+| `yeelight_ambilight.py` | Command-line program |
+| `tray_app.py` | Tray application (preview) |
+| `ambilight_core.py` | The engine: screen analysis, color pipeline, sender, and the controllable `Engine` class |
+| `yeelight_lan.py` | Lamp discovery, TCP and UDP clients |
+| `probe.py` | Measuring tool for the lamp's behavior |
+| `latency_flash.py` | Red/blue flasher for latency tests with a phone camera |
 
 ## Requirements
 
@@ -52,6 +64,28 @@ pip install -r requirements.txt
 
 Keep the project in a folder you can write to (for example under your user directory). A protected location such as `C:\Program Files` makes saving files like `--save-strip` fail.
 
+## Tray application (preview, Windows)
+
+Instead of a console window the program can live in the notification area:
+
+```powershell
+python tray_app.py          # with a console, good for the first try
+pythonw tray_app.py         # no console window
+```
+
+The icon shows the state (the two halves follow the screen when it runs, gray when Ambilight is off, yellow while connecting, red when the lamp is not found). The menu:
+
+| Item | What it does |
+| --- | --- |
+| Status | Running, connecting, lamp not found (it keeps retrying), error |
+| Ambilight | On: the rear light follows the screen. Off: the rear light is switched off |
+| Front light on / off | The bar's front (desk) light. Applied after a short pause of the color stream, because the lamp ignores such commands right after a color frame |
+| Start with Windows | Adds or removes the program in the current user's login items (it starts without a console window) |
+| Open log | Opens `%LOCALAPPDATA%\YeelightAmbilight\ambilight.log` |
+| Quit | Stops the program and switches the rear light off (takes about a second and a half) |
+
+Only one instance can run at a time. Options are the same as for the command line (`--config`, `--ip`, `--bright-max`, `--debug`, and so on). Brightness and color temperature sliders and a console window are planned (see the roadmap). This is a first version, not yet verified on a real Windows setup.
+
 ## Finding the lamp
 
 There is nothing to configure. On start the program searches the LAN for Yeelight devices (SSDP multicast on every network interface), picks the lamp15, and remembers its device `id` in `~/.yeelight_ambilight_lamp.json`. If the lamp later gets a new IP address from DHCP, it is meant to be found again by that `id` (implemented, but not yet verified on a real address change).
@@ -86,7 +120,7 @@ Example start-up output:
 
 ```text
 =======================================================
-Yeelight Ambilight 0.5.0-dev (r10 lock 1.3 s)
+Yeelight Ambilight 0.5.0-dev (r11 engine + tray preview)
 =======================================================
 Lamp: lamp15 fw 38 192.168.0.50 id 0x0000000012345678
 Capture 60 fps, lamp 30 fps, brightness 60 (fixed)
@@ -252,6 +286,7 @@ capture  59.0 fps (11.5 ms/frame) | lamp  24.0/s | sw  18/ 35 ms | bright  60 | 
 | `python probe.py udpgap` | Whether brightness commands are applied right after a segment command |
 | `python probe.py lock [--gaps 900,1100,1300]` | How long brightness commands are ignored after a segment command (choose the gaps to narrow it down) |
 | `python probe.py frontlock` | Whether the front light's brightness is also ignored right after a segment command |
+| `python probe.py frontct` | The front light's color temperature: accepted range and whether it is also ignored right after a segment command |
 | `python probe.py segbright` | Which commands change brightness in segment mode |
 | `python probe.py segmix` | Brightness routes after segments were sent over UDP |
 | `python probe.py tcpsustain --fps 30` | A sustained TCP stream, to see the quota |
@@ -313,6 +348,7 @@ Measured on a real device; they may differ on other models or firmware.
 * After a segment command the lamp ignores brightness commands (`bg_set_bright`, TCP or UDP) for about one second: ignored at 0.9 s, sometimes applied at 1.0 s, always applied from 1.1 s. The front light's `set_bright` is ignored in the same way.
 * The same quiet period is needed for **power commands**: `bg_set_power off` sent right after a color frame is acknowledged (`ok`) but has no effect, and the lamp keeps reporting `bg_power: on`. Always check the result with `get_prop`.
 * A UDP `bg_set_rgb` leaves segment mode (the whole rear light shows one color again). `bg_set_scene` with `"color"` sets color and brightness in one command (tested over TCP).
+* The front light's color temperature is set with `set_ct_abx` (`[kelvin, effect, duration]`). The accepted range is at least 2700–6500 K (2000 and 7000 are rejected with `invalid params`). It is ignored right after a segment command like brightness: not applied up to 0.8 s, applied at 1.5 s.
 * `bg_set_power` controls the rear light; `set_power` controls the front light. The `power` property looks like a combined flag that stays `on` while either light is on.
 * `udp_chroma_sess_new` works over UDP only (it returns a normal session token); over TCP it answers "method not supported". What it is used for is not documented.
 * The lamp has no `set_music` method.
@@ -350,16 +386,17 @@ Current version: **0.5.0-dev**. The v0.4 and v0.5 items below ship together as r
 * [ ] Native Windows executable
 * [ ] System tray integration
 * [ ] Auto-start with Windows
-* [ ] Background mode: start at Windows login, no console window (a real Windows service cannot capture the screen)
+* [ ] Background mode: start at Windows login, no console window (a real Windows service cannot capture the screen). Written, to be verified
 * [ ] Automatic reconnection after DHCP IP changes (moved from v0.4: implemented in the engine, a real address change still has to be tried; the tray shows the connection status)
 
 #### Tray application (minimal GUI)
 
-* [ ] Core refactor: ambilight engine controllable from outside the CLI (start / stop / status / log events)
-* [ ] Taskbar (notification area) icon with a context menu
-* [ ] Ambilight on / off
-* [ ] Power on / off for each light separately: rear (RGB) and front (desk)
-* [ ] Brightness sliders for the rear and the front light in a small popup window opened from the tray (the tray menu itself cannot hold a slider). The value is applied when the slider is released; the color stream pauses for about a second and a half while the lamp accepts the new brightness (the lamp ignores brightness changes of both lights right after a color frame)
+* [x] Core refactor: ambilight engine controllable from outside the CLI (start / stop / status / log events)
+* [ ] Taskbar (notification area) icon with a context menu (first version written, to be verified on Windows)
+* [ ] Ambilight on / off (in the first version)
+* [ ] Power on / off for each light separately: rear (RGB) and front (desk) (in the first version: the Ambilight switch for the rear light, on / off items for the front light)
+* [ ] Sliders in a small popup window opened from the tray: brightness of the rear light, brightness of the front light, and the color temperature of the front light (warm to cold white, 2700–6500 K as measured with `probe.py frontct`)
+* [ ] Slider values are applied when the slider is released (the tray menu itself cannot hold a slider). While colors stream, the lamp ignores brightness changes of both lights right after a color frame, so the color stream pauses for about a second and a half while the new value is applied; the color temperature needs the same pause (measured), and changes of several sliders can be applied in one pause
 * [ ] Automatic reconnect after signal loss (Wi-Fi drop, lamp reboot, new DHCP address) with a connection status indicator in the tray
 * [ ] Debug console window: live log (capture FPS, lamp frames/s, errors, real lamp state), copy and save log
 * [ ] GUI toolkit decision (candidate: `pystray` for the tray icon and `tkinter` for the popup and console windows)
