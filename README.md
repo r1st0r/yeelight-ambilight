@@ -24,6 +24,8 @@ The program captures the top strip of your screen and mirrors its colors to the 
 | --- | --- |
 | `yeelight_ambilight.py` | Command-line program |
 | `tray_app.py` | Tray application (preview) |
+| `build_exe.bat` | Builds `dist\YeelightAmbilight.exe` with PyInstaller (Windows) |
+| `panel.py` | Sliders window and debug console opened from the tray |
 | `ambilight_core.py` | The engine: screen analysis, color pipeline, sender, and the controllable `Engine` class |
 | `yeelight_lan.py` | Lamp discovery, TCP and UDP clients |
 | `probe.py` | Measuring tool for the lamp's behavior |
@@ -84,7 +86,7 @@ The icon shows the state (the two halves follow the screen when it runs, gray wh
 | Open log | Opens `%LOCALAPPDATA%\YeelightAmbilight\ambilight.log` |
 | Quit | Stops the program and switches the rear light off (takes about a second and a half) |
 
-Only one instance can run at a time. Options are the same as for the command line (`--config`, `--ip`, `--bright-max`, `--debug`, and so on). Brightness and color temperature sliders and a console window are planned (see the roadmap). This is a first version, not yet verified on a real Windows setup.
+When Windows shuts down, restarts or logs off, the tray application switches the rear light off (a hidden window listens for the end-of-session message; the log shows `[tray] Windows is ending the session`). Only one instance can run at a time. Options are the same as for the command line (`--config`, `--ip`, `--bright-max`, `--debug`, and so on). Brightness and color temperature sliders and a console window are planned (see the roadmap). This is a first version, not yet verified on a real Windows setup.
 
 ## Finding the lamp
 
@@ -120,7 +122,7 @@ Example start-up output:
 
 ```text
 =======================================================
-Yeelight Ambilight 0.5.0-dev (r11 engine + tray preview)
+Yeelight Ambilight 0.5.0-dev (r12 zone reach + session end)
 =======================================================
 Lamp: lamp15 fw 38 192.168.0.50 id 0x0000000012345678
 Capture 60 fps, lamp 30 fps, brightness 60 (fixed)
@@ -172,13 +174,16 @@ Command-line options override the file. Unknown keys stop the program with an er
 | `udp_gap_s` | `0.02` | Minimum time between two UDP datagrams |
 | `lock_s` | `1.3` | Power-off waits this long after the last color frame, because the lamp ignores power and brightness commands for about a second (1.05 s measured) after a frame |
 | `center_overlap` | `0.08` | The zones meet at the center of the captured monitor and overlap by this share of the width. `0` gives a hard split |
+| `zone_reach` | `0.7` | How far each zone extends from the center, as a share of its half. The outer edges, where game HUDs and inventories live, are ignored. `1.0` samples the whole half |
 | `bright_max` | `60` | Brightness of the rear light (see [How it works](#how-it-works)) |
 | `sat_boost` | `1.1` | Saturation boost of the sampled colors |
 | `chroma_min` | `10.0` | A side darker than this keeps its previous color |
 | `tau_slow` | `0.15` | Color smoothing time for slow changes, in seconds |
 | `tau_fast` | `0.02` | Color smoothing time for fast changes, in seconds |
 | `cut_distance` | `60.0` | Color change that counts as a fast scene |
-| `black_threshold` | `7.0` | A side at or below this brightness counts as black |
+| `black_threshold` | `7.0` | Both sides at or below this brightness: the whole light switches off after `dark_hold_s` |
+| `side_dark_threshold` | `7.0` | A single side at or below this brightness is shown dark. Raise it (for example to 25) to darken dim scenes |
+| `side_wake_threshold` | `12.0` | A dark side lights up again above this (always kept at least 4 above `side_dark_threshold`) |
 | `min_lit_fraction` | `0.2` | A side with less than this share of lit columns counts as dark, even if its average is not black |
 | `lit_hysteresis` | `0.1` | A dark side needs this much more than `min_lit_fraction` to light up again |
 | `wake_threshold` | `12.0` | A side above this brightness lights up again |
@@ -226,9 +231,9 @@ A single sender thread always sends the newest frame, so a slow network can drop
 
 ### Dark scenes
 
-* A side is sent as `(0,0,0)` when it is black (its average brightness is at or below `black_threshold`) **or** when only a small part of it is lit (less than `min_lit_fraction` of its width). The second rule matters because the lamp cannot dim a color: without it, a thin bright strip next to a black half would light the whole half at full brightness. A side lights up again only when clearly lit (above `wake_threshold` and `min_lit_fraction` + `lit_hysteresis`), so it does not flicker.
+* A side is sent as `(0,0,0)` when it is black (its average brightness is at or below `side_dark_threshold`) **or** when only a small part of it is lit (less than `min_lit_fraction` of its width). The second rule matters because the lamp cannot dim a color: without it, a thin bright strip next to a black half would light the whole half at full brightness. A side lights up again only when clearly lit (above `side_wake_threshold` and `min_lit_fraction` + `lit_hysteresis`), so it does not flicker.
 * A dark side is not completely off: `(0,0,0)` leaves a faint glow. Only switching the whole light off makes it fully dark.
-* When both sides stay black for `dark_hold_s` seconds, the rear light is switched off completely. The lamp acknowledges a power command but ignores it for about a second after a color frame, so the program stops sending frames, waits `lock_s`, sends the command, and then asks the lamp whether it really switched off (it retries if not). Because of the wait, the light goes out roughly `dark_hold_s` seconds after the screen turns black.
+* When both sides stay black (at or below `black_threshold`) for `dark_hold_s` seconds, the rear light is switched off completely. The lamp acknowledges a power command but ignores it for about a second after a color frame, so the program stops sending frames, waits `lock_s`, sends the command, and then asks the lamp whether it really switched off (it retries if not). Because of the wait, the light goes out roughly `dark_hold_s` seconds after the screen turns black.
 * On exit the program does the same, so the light is really off after `Ctrl+C` (this takes about two seconds).
 * When the picture gets bright again the light switches back on. The lamp needs about a second to visibly switch on or off, although it acknowledges the command within a few milliseconds.
 
@@ -286,7 +291,9 @@ capture  59.0 fps (11.5 ms/frame) | lamp  24.0/s | sw  18/ 35 ms | bright  60 | 
 | `python probe.py udpgap` | Whether brightness commands are applied right after a segment command |
 | `python probe.py lock [--gaps 900,1100,1300]` | How long brightness commands are ignored after a segment command (choose the gaps to narrow it down) |
 | `python probe.py frontlock` | Whether the front light's brightness is also ignored right after a segment command |
+| `python probe.py dither [--fps 60] [--smooth 150]` | Whether alternating a color with `(0,0,0)` frames can emulate dimmer light (you judge brightness and flicker); `--smooth` adds a fade time to every frame (tried: still flickers) |
 | `python probe.py frontct` | The front light's color temperature: accepted range and whether it is also ignored right after a segment command |
+| `python probe.py brightstream` | Whether a brightness change survives when the UDP color stream resumes (the slider case) |
 | `python probe.py segbright` | Which commands change brightness in segment mode |
 | `python probe.py segmix` | Brightness routes after segments were sent over UDP |
 | `python probe.py tcpsustain --fps 30` | A sustained TCP stream, to see the quota |
@@ -312,7 +319,9 @@ Add `--ip ADDRESS` before the command to skip discovery. Session tokens printed 
 
 **Colors look white or washed out.** Gray and desaturated scenes show as white, because a segment color carries only hue and saturation. Raise `sat_boost` if you want more color.
 
-**The brightness does not follow the scene.** By design: the lamp ignores brightness commands while colors are streaming. Set the level you like with `bright_max`.
+**The brightness does not follow the scene (dark game scenes stay bright), and a rear brightness slider has no effect.** Measured with `probe.py brightstream`: every new segment color frame brings the rear light back to full brightness, and the value set with `bg_set_bright` (which the lamp reports correctly) only shows after the colors have stopped for about a second. So while Ambilight runs, the rear light is always at full brightness and `bright_max` has no visible effect. Raise `side_dark_threshold` (for example 25) so that the dimmest scenes switch a side dark instead. Emulating dimmer light by alternating color and dark frames was tried (`probe.py dither`) and makes the light flicker visibly at 30 and 60 frames per second; a variant with fades is still to be tried.
+
+**A HUD in the corner of the screen (an inventory, a minimap) colors the light.** Lower `zone_reach` (for example 0.5): each zone then samples only that share of its half, counted from the center of the screen.
 
 **Capture is a wrong area.** Run with `--save-strip strip.png` and look at the image. Use `--monitor N` for another display.
 
@@ -320,7 +329,7 @@ Add `--ip ADDRESS` before the command to skip discovery. Session tokens printed 
 
 ## Limitations
 
-* The brightness of the rear light is fixed (`bright_max`); it cannot follow the scene while colors stream.
+* While colors stream the rear light is always at full brightness (a color frame resets it); it cannot be dimmed or follow the scene.
 * A half of the screen is either shown in full brightness or, when it is black, switched dark. There are no dim levels in between.
 * The lamp takes about a second to visibly switch on or off.
 * Only one monitor is captured at a time.
@@ -395,7 +404,7 @@ Current version: **0.5.0-dev**. The v0.4 and v0.5 items below ship together as r
 * [ ] Taskbar (notification area) icon with a context menu (first version written, to be verified on Windows)
 * [ ] Ambilight on / off (in the first version)
 * [ ] Power on / off for each light separately: rear (RGB) and front (desk) (in the first version: the Ambilight switch for the rear light, on / off items for the front light)
-* [ ] Sliders in a small popup window opened from the tray: brightness of the rear light, brightness of the front light, and the color temperature of the front light (warm to cold white, 2700–6500 K as measured with `probe.py frontct`)
+* [ ] Sliders in a small popup window opened from the tray: brightness of the front light and the color temperature of the front light (warm to cold white, 2700–6500 K as measured with `probe.py frontct`)
 * [ ] Slider values are applied when the slider is released (the tray menu itself cannot hold a slider). While colors stream, the lamp ignores brightness changes of both lights right after a color frame, so the color stream pauses for about a second and a half while the new value is applied; the color temperature needs the same pause (measured), and changes of several sliders can be applied in one pause
 * [ ] Automatic reconnect after signal loss (Wi-Fi drop, lamp reboot, new DHCP address) with a connection status indicator in the tray
 * [ ] Debug console window: live log (capture FPS, lamp frames/s, errors, real lamp state), copy and save log
@@ -405,7 +414,7 @@ Current version: **0.5.0-dev**. The v0.4 and v0.5 items below ship together as r
 
 * [x] UDP-based segment updates (`set_segment_rgb` works over the UDP session)
 * [x] Higher refresh rates (30 frames per second works; 60 not tested yet)
-* [ ] A way to change the rear light's brightness while colors stream (the lamp ignores brightness for about 1 second after each segment command)
+* [ ] A way to change the rear light's brightness while colors stream (the lamp ignores brightness for about 1 second after each segment command). Alternating the color with `(0,0,0)` frames (`probe.py dither`) flickers at 30 and 60 frames per second and does not give a steady dimmer light; a variant with fade times is still to be tried
 * [ ] Format of the undocumented `udp_chroma_sess_new` realtime session (idea: capture the official app's traffic)
 * [ ] Lower latency Ambilight mode
 * [ ] Hardware acceleration experiments
@@ -414,9 +423,6 @@ Current version: **0.5.0-dev**. The v0.4 and v0.5 items below ship together as r
 
 * [ ] GUI configuration tool (full settings window; the minimal controls live in the v0.7 tray application)
 * [ ] Presets and profiles
-* [ ] Plugin architecture
-* [ ] Support for additional Yeelight devices
-* [ ] Cross-device ambient ecosystem
 
 ## Disclaimer
 
