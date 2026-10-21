@@ -17,6 +17,7 @@ from PIL import Image, ImageDraw, ImageTk
 
 from color_picker import ColorPicker
 from stage import render_stage, temp_rgb
+from winstyle import Dragger, center, round_corners
 
 DESIGN_W, DESIGN_H = 1280, 800
 C_BG, C_CARD, C_LINE, C_TRACK = "#05080F", "#0B101D", "#1A2338", "#1E2840"
@@ -41,11 +42,15 @@ class ControlWindow:
         self._stage_t = 0.0
         self._stage_photo = None
         self._bar_photo = None
+        self._shapes = {}
+        self._hover_btn = None
+        self._moving = False
 
         win = self.win = tk.Toplevel(root)
         win.title("Yeelight Ambilight")
         win.configure(bg=C_BG)
         win.resizable(False, False)
+        win.overrideredirect(True)                       # no Windows title bar: the app draws its own
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
         self.s = s = max(0.45, min(1.0, (sw - 40) / DESIGN_W, (sh - 120) / DESIGN_H))
         self.W, self.H = int(DESIGN_W * s), int(DESIGN_H * s)
@@ -54,6 +59,9 @@ class ControlWindow:
                            "TkDefaultFont")
         self.canvas = tk.Canvas(win, width=self.W, height=self.H, bg=C_BG, highlightthickness=0)
         self.canvas.pack()
+        center(win, self.W, self.H)
+        self._drag = Dragger(win)
+        round_corners(win)
         self._stage_item = self.canvas.create_image(0, 0, anchor="nw")
         self.canvas.bind("<Button-1>", self._press)
         self.canvas.bind("<B1-Motion>", self._motion)
@@ -62,6 +70,7 @@ class ControlWindow:
         win.protocol("WM_DELETE_WINDOW", win.withdraw)
         win.attributes("-topmost", True)
         win.after(300, lambda: win.attributes("-topmost", False))     # in front on open, then a normal window
+        win.after(100, win.focus_force)
         self.refresh()
         self._tick()
 
@@ -80,10 +89,59 @@ class ControlWindow:
                                        font=fnt, tags="ui")
 
     def rrect(self, x0, y0, x1, y1, r, fill="", outline="", width=1, tags="ui"):
-        r = min(r, (x1 - x0) / 2, (y1 - y0) / 2)
-        pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1,
-               x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
-        return self.canvas.create_polygon(pts, smooth=True, fill=fill, outline=outline, width=width, tags=tags)
+        """An anti-aliased rounded rectangle (drawn 4x larger with Pillow, then scaled down and cached).
+        Tk's own polygons and ovals have jagged edges, so every shape goes through here."""
+        w, h = max(2, int(round(x1 - x0))), max(2, int(round(y1 - y0)))
+        key = (w, h, round(r, 1), fill, outline, width)
+        photo = self._shapes.get(key)
+        if photo is None:
+            ss = 4
+            im = Image.new("RGBA", (w * ss, h * ss), (0, 0, 0, 0))
+            ImageDraw.Draw(im).rounded_rectangle(
+                (0, 0, w * ss - 1, h * ss - 1), radius=min(r, w / 2, h / 2) * ss, fill=fill or None,
+                outline=outline or None, width=max(1, int(round(width * ss))))
+            photo = self._shapes[key] = ImageTk.PhotoImage(im.resize((w, h), Image.LANCZOS))
+        return self.canvas.create_image(int(round(x0)), int(round(y0)), anchor="nw", image=photo, tags=tags)
+
+    def _window_icon(self, kind, cx, cy, color):
+        """A 14 px minus or cross, anti-aliased, cached."""
+        size = max(8, int(round(self.S(14))))
+        key = ("icon", kind, size, color)
+        photo = self._shapes.get(key)
+        if photo is None:
+            ss, big = 6, size * 6
+            im = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+            d = ImageDraw.Draw(im)
+            width = max(2, int(big * 0.11))
+            pad = big * 0.1
+            if kind == "winmin":
+                d.line((pad, big / 2, big - pad, big / 2), fill=color, width=width)
+            else:
+                d.line((pad, pad, big - pad, big - pad), fill=color, width=width)
+                d.line((pad, big - pad, big - pad, pad), fill=color, width=width)
+            photo = self._shapes[key] = ImageTk.PhotoImage(im.resize((size, size), Image.LANCZOS))
+        return self.canvas.create_image(int(round(cx - size / 2)), int(round(cy - size / 2)), anchor="nw",
+                                        image=photo, tags="ui")
+
+    def oval(self, x0, y0, x1, y1, fill="", outline="", width=1, tags="ui"):
+        return self.rrect(x0, y0, x1, y1, max(x1 - x0, y1 - y0), fill=fill, outline=outline, width=width, tags=tags)
+
+    def gradient_track(self, x0, x1, ty, low, high):
+        """A thin rounded bar colored by the white temperature (warm to cold)."""
+        w, h = max(2, int(round(x1 - x0))), max(3, int(round(self.S(4))))
+        key = ("grad", w, h, low, high)
+        photo = self._shapes.get(key)
+        if photo is None:
+            strip = Image.new("RGB", (w, 1))
+            for x in range(w):
+                strip.putpixel((x, 0), temp_rgb(low + (high - low) * x / max(1, w - 1)))
+            ss = 4
+            bar = strip.resize((w * ss, h * ss), Image.NEAREST).convert("RGBA")
+            mask = Image.new("L", (w * ss, h * ss), 0)
+            ImageDraw.Draw(mask).rounded_rectangle((0, 0, w * ss - 1, h * ss - 1), radius=h * ss / 2, fill=255)
+            bar.putalpha(mask)
+            photo = self._shapes[key] = ImageTk.PhotoImage(bar.resize((w, h), Image.LANCZOS))
+        return self.canvas.create_image(int(round(x0)), int(round(ty - h / 2)), anchor="nw", image=photo, tags="ui")
 
     # ----- state ----------------------------------------------------------------
     def _status(self):
@@ -161,9 +219,19 @@ class ControlWindow:
         fnt = self.font(13)
         tw = fnt.measure(label)
         pill_w, pill_h = tw + S(14 * 2 + 16), S(36)
-        px1 = self.W - S(40)
+        bsize = S(36)                                    # window buttons: minimize (to the tray) and close
+        close_x1 = self.W - S(20)
+        for kind, bx1 in (("winclose", close_x1), ("winmin", close_x1 - bsize - S(4))):
+            bx0 = bx1 - bsize
+            hot = (self._hover_btn == kind)
+            if hot:
+                self.rrect(bx0, cy - bsize / 2, bx1, cy + bsize / 2, S(10),
+                           fill="#3B1F26" if kind == "winclose" else C_LINE)
+            self._window_icon(kind, (bx0 + bx1) / 2, cy, "#F87171" if hot and kind == "winclose" else C_TEXT)
+            self.hits.append((bx0, cy - bsize / 2, bx1, cy + bsize / 2, kind, None))
+        px1 = close_x1 - 2 * bsize - S(4) - S(16)
         self.rrect(px1 - pill_w, cy - pill_h / 2, px1, cy + pill_h / 2, pill_h / 2, fill="#0C1220", outline=C_LINE)
-        c.create_oval(px1 - pill_w + S(14), cy - S(4), px1 - pill_w + S(22), cy + S(4), fill=color, outline="",
+        self.oval(px1 - pill_w + S(14), cy - S(4), px1 - pill_w + S(22), cy + S(4), fill=color, outline="",
                       tags="ui")
         c.create_text(px1 - pill_w + S(30), cy, text=label, anchor="w", fill=C_MUTED, font=fnt, tags="ui")
 
@@ -173,6 +241,7 @@ class ControlWindow:
         top = DESIGN_H - 40 - card_h
         self._front_card(S(40), S(top), S(40 + card_w), S(top + card_h), v)
         self._back_card(S(40 + card_w + 24), S(top), S(DESIGN_W - 40), S(top + card_h))
+        c.create_rectangle(0, 0, self.W - 1, self.H - 1, outline=C_LINE, tags="ui")      # thin window border
 
     def _card_frame(self, x0, y0, x1, y1, title, subtitle, state, toggle_key):
         S = self.S
@@ -186,7 +255,7 @@ class ControlWindow:
         tx0, ty1 = tx1 - S(52), ty0 + S(30)
         self.rrect(tx0, ty0, tx1, ty1, S(15), fill=C_TEXT if state else C_TRACK)
         kx = (tx1 - S(3) - S(24)) if state else (tx0 + S(3))
-        self.canvas.create_oval(kx, ty0 + S(3), kx + S(24), ty0 + S(27), fill=C_BG if state else C_KNOB_OFF,
+        self.oval(kx, ty0 + S(3), kx + S(24), ty0 + S(27), fill=C_BG if state else C_KNOB_OFF,
                                 outline="", tags="ui")
         self.hits.append((tx0, ty0, tx1, ty1, "toggle", toggle_key))
 
@@ -196,17 +265,12 @@ class ControlWindow:
         c.create_text(x1, y_label, text=value_text, anchor="ne", fill=C_MUTED, font=self.font(13), tags="ui")
         ty = y_label + S(32)
         if gradient:
-            steps = 40
-            span = (x1 - x0)
-            for i in range(steps):
-                col = "#%02x%02x%02x" % temp_rgb(low + (high - low) * i / (steps - 1))
-                c.create_rectangle(x0 + span * i / steps, ty - S(2), x0 + span * (i + 1) / steps + 1, ty + S(2),
-                                   fill=col, outline="", tags="ui")
+            self.gradient_track(x0, x1, ty, low, high)
         else:
-            c.create_rectangle(x0, ty - S(2), x1, ty + S(2), fill=C_TRACK, outline="", tags="ui")
+            self.rrect(x0, ty - S(2), x1, ty + S(2), S(2), fill=C_TRACK)
         tx = x0 + (value - low) / (high - low) * (x1 - x0)
-        c.create_oval(tx - S(13), ty - S(13), tx + S(13), ty + S(13), fill=C_RING, outline="", tags="ui")
-        c.create_oval(tx - S(9), ty - S(9), tx + S(9), ty + S(9), fill=C_TEXT, outline="", tags="ui")
+        self.oval(tx - S(13), ty - S(13), tx + S(13), ty + S(13), fill=C_RING, outline="", tags="ui")
+        self.oval(tx - S(9), ty - S(9), tx + S(9), ty + S(9), fill=C_TEXT, outline="", tags="ui")
         self.hits.append((x0 - S(12), ty - S(16), x1 + S(12), ty + S(16), "slider", (key, low, high, x0, x1)))
 
     def _front_card(self, x0, y0, x1, y1, v):
@@ -268,12 +332,12 @@ class ControlWindow:
             px = cx + i * gap
             selected = col.upper() == current
             if selected:
-                c.create_oval(px - r - S(4), cy - r - S(4), px + r + S(4), cy + r + S(4), fill="", outline=C_TEXT,
+                self.oval(px - r - S(4), cy - r - S(4), px + r + S(4), cy + r + S(4), fill="", outline=C_TEXT,
                               width=max(1, S(2)), tags="ui")
-            c.create_oval(px - r, cy - r, px + r, cy + r, fill=col, outline="", tags="ui")
+            self.oval(px - r, cy - r, px + r, cy + r, fill=col, outline="", tags="ui")
             self.hits.append((px - r - S(4), cy - r - S(4), px + r + S(4), cy + r + S(4), "swatch", col))
         px = cx + len(colors) * gap                                # the "more colors" button
-        c.create_oval(px - r, cy - r, px + r, cy + r, fill=C_TRACK, outline=C_LINE, tags="ui")
+        self.oval(px - r, cy - r, px + r, cy + r, fill=C_TRACK, outline=C_LINE, tags="ui")
         self.ctext(px, cy, "+", C_TEXT, self.font(18, "bold"))
         self.hits.append((px - r, cy - r, px + r, cy + r, "picker", None))
         self._slider(x0 + S(24), x1 - S(24), y0 + S(176), "Brightness", f"{v['solid_bright']}%", "solid_bright",
@@ -287,14 +351,25 @@ class ControlWindow:
         return None
 
     def _hover(self, event):
-        self.canvas.config(cursor="hand2" if self._find(event.x, event.y) else "")
+        hit = self._find(event.x, event.y)
+        self.canvas.config(cursor="hand2" if hit else "")
+        button = hit[4] if hit and hit[4] in ("winmin", "winclose") else None
+        if button != self._hover_btn:
+            self._hover_btn = button
+            self.refresh()
 
     def _press(self, event):
         hit = self._find(event.x, event.y)
         if not hit:
+            if event.y < self.S(72):                     # the title strip moves the window
+                self._moving = True
+                self._drag.press(event)
             return
         kind, data = hit[4], hit[5]
-        if kind == "toggle":
+        if kind in ("winmin", "winclose"):               # both hide the window; the app lives in the tray
+            self._hover_btn = None
+            self.win.withdraw()
+        elif kind == "toggle":
             if data == "front_on":
                 self.panel._toggle_front(not self.panel.values["front_on"])
             else:
@@ -317,10 +392,16 @@ class ControlWindow:
         self.refresh()
 
     def _motion(self, event):
+        if self._moving:
+            self._drag.move(event)
+            return
         if self.drag:
             self._set_from_x(event.x)
 
     def _release(self, event):
+        if self._moving:
+            self._moving = False
+            return
         if not self.drag:
             return
         key = self.drag[0]
@@ -346,4 +427,5 @@ class ControlWindow:
     def show(self):
         self.win.deiconify()
         self.win.lift()
+        self.win.focus_force()
         self.refresh()

@@ -7,6 +7,8 @@ import tkinter as tk
 
 from PIL import Image, ImageTk
 
+from winstyle import Dragger, center, round_corners
+
 BG, CARD, LINE, TRACK, TEXT, MUTED = "#05080F", "#0B101D", "#1A2338", "#1E2840", "#E8ECF7", "#A9B3CC"
 SV_W, SV_H, HUE_H = 240, 170, 16
 
@@ -25,14 +27,32 @@ class ColorPicker:
         self.h, self.s, self.v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
         win = self.win = tk.Toplevel(parent)
         win.title("Pick a color")
-        win.configure(bg=BG, padx=18, pady=16)
+        win.configure(bg=LINE, padx=1, pady=1)                      # 1 px border around the dark window
         win.resizable(False, False)
+        win.overrideredirect(True)                                  # no Windows title bar: our own strip below
         win.attributes("-topmost", True)
-        win.transient(parent)
+        inner = tk.Frame(win, bg=BG)
+        inner.pack()
+        drag = Dragger(win)
+        strip = tk.Frame(inner, bg=BG)
+        strip.pack(fill="x")
+        title = tk.Label(strip, text="Pick a color", bg=BG, fg=TEXT, font=(family, 11, "bold"), padx=18, pady=10)
+        title.pack(side="left")
+        close = tk.Label(strip, text="\u2715", bg=BG, fg=MUTED, font=(family, 11), padx=14, pady=10, cursor="hand2")
+        close.pack(side="right")
+        close.bind("<Button-1>", lambda _e: win.destroy())
+        close.bind("<Enter>", lambda _e: close.config(bg="#3B1F26", fg="#F87171"))
+        close.bind("<Leave>", lambda _e: close.config(bg=BG, fg=MUTED))
+        for widget in (strip, title):
+            widget.bind("<Button-1>", drag.press)
+            widget.bind("<B1-Motion>", drag.move)
+        body = tk.Frame(inner, bg=BG, padx=18, pady=0)
+        body.pack()
+        tk.Frame(inner, bg=BG, height=16).pack()
 
-        self.sv = tk.Canvas(win, width=SV_W, height=SV_H, bg=BG, highlightthickness=0, cursor="crosshair")
+        self.sv = tk.Canvas(body, width=SV_W, height=SV_H, bg=BG, highlightthickness=0, cursor="crosshair")
         self.sv.grid(row=0, column=0, columnspan=4)
-        self.hue = tk.Canvas(win, width=SV_W, height=HUE_H + 8, bg=BG, highlightthickness=0, cursor="hand2")
+        self.hue = tk.Canvas(body, width=SV_W, height=HUE_H + 8, bg=BG, highlightthickness=0, cursor="hand2")
         self.hue.grid(row=1, column=0, columnspan=4, pady=(10, 12))
         self._sv_item = self.sv.create_image(0, 0, anchor="nw")
         self._hue_photo = self._make_hue_bar()
@@ -44,18 +64,18 @@ class ColorPicker:
         self.hue.bind("<Button-1>", self._hue_pick)
         self.hue.bind("<B1-Motion>", self._hue_pick)
 
-        self.preview = tk.Frame(win, width=44, height=44, bg=BG, highlightthickness=1, highlightbackground=LINE)
+        self.preview = tk.Frame(body, width=44, height=44, bg=BG, highlightthickness=1, highlightbackground=LINE)
         self.preview.grid(row=2, column=0, rowspan=2, sticky="w", padx=(0, 12))
         self.preview.grid_propagate(False)
         font = (family, 10)
         self.hex_var = tk.StringVar()
         self.rgb_vars = [tk.StringVar() for _ in range(3)]
-        tk.Label(win, text="HEX", bg=BG, fg=MUTED, font=font).grid(row=2, column=1, sticky="w")
-        hex_entry = self._entry(win, self.hex_var, 9)
+        tk.Label(body, text="HEX", bg=BG, fg=MUTED, font=font).grid(row=2, column=1, sticky="w")
+        hex_entry = self._entry(body, self.hex_var, 9)
         hex_entry.grid(row=3, column=1, sticky="w")
         hex_entry.bind("<Return>", lambda _e: self._from_hex())
         hex_entry.bind("<FocusOut>", lambda _e: self._from_hex())
-        box = tk.Frame(win, bg=BG)
+        box = tk.Frame(body, bg=BG)
         box.grid(row=2, column=2, rowspan=2, columnspan=2, sticky="e", padx=(12, 0))
         for i, name in enumerate("RGB"):
             tk.Label(box, text=name, bg=BG, fg=MUTED, font=font).grid(row=0, column=i)
@@ -64,12 +84,17 @@ class ColorPicker:
             entry.bind("<Return>", lambda _e: self._from_rgb())
             entry.bind("<FocusOut>", lambda _e: self._from_rgb())
 
-        buttons = tk.Frame(win, bg=BG)
+        buttons = tk.Frame(body, bg=BG)
         buttons.grid(row=4, column=0, columnspan=4, sticky="e", pady=(16, 0))
         for text, command, fill, fg in (("Cancel", win.destroy, TRACK, TEXT), ("Apply", self._apply, TEXT, BG)):
             tk.Button(buttons, text=text, command=command, bg=fill, fg=fg, activebackground=fill, activeforeground=fg,
                       bd=0, padx=16, pady=5, font=font, cursor="hand2").pack(side="left", padx=(8, 0))
         win.bind("<Escape>", lambda _e: win.destroy())
+        px = parent.winfo_rootx() + (parent.winfo_width() - 300) // 2
+        py = parent.winfo_rooty() + 120
+        win.geometry(f"+{max(0, px)}+{max(0, py)}")
+        round_corners(win)
+        win.after(80, win.focus_force)
         self._sv_photo = None
         self._sv_hue = None
         self._redraw()

@@ -28,6 +28,7 @@ except ImportError:          # reported properly in main()
     Image = ImageDraw = None
 
 from ambilight_core import BUILD, VERSION, Engine, load_config
+from icon_art import lamp_layer
 from panel import Panel
 
 APP_NAME = "YeelightAmbilight"
@@ -136,21 +137,7 @@ def set_autostart(enabled: bool, config_path=None) -> None:
 
 def make_icon():
     """A miniature of the light bar (no status marks: the status lives in the app window)."""
-    big = 256
-    bar = Image.new("RGBA", (big, big), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(bar)
-    for y in range(44, 132):                                  # the brushed-metal bar: light on top, darker below
-        shade = int(236 - 80 * (y - 44) / 88.0)
-        draw.line((8, y, 248, y), fill=(shade, shade + 2, shade + 6, 255))
-    mask = Image.new("L", (big, big), 0)
-    ImageDraw.Draw(mask).rounded_rectangle((8, 44, 248, 132), radius=30, fill=255)
-    image = Image.new("RGBA", (big, big), (0, 0, 0, 0))
-    image.paste(bar, (0, 0), mask)
-    draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((32, 100, 224, 118), radius=9, fill=(255, 248, 225, 255))      # the glowing edge
-    draw.rounded_rectangle((92, 132, 164, 220), radius=12, fill=(118, 124, 138, 255))     # the clamp
-    draw.rounded_rectangle((92, 132, 164, 156), radius=8, fill=(160, 166, 180, 255))
-    return image.resize((64, 64), Image.LANCZOS)
+    return lamp_layer(256).resize((64, 64), Image.LANCZOS)
 
 
 class SessionEndWatcher:

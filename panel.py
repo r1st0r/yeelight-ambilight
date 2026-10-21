@@ -178,27 +178,53 @@ class Panel:
             self._console.deiconify()
             self._console.lift()
             return
+        from winstyle import Dragger, center, round_corners
+        BG, LINE, TRACK, TEXT, MUTED = "#05080F", "#1A2338", "#1E2840", "#E8ECF7", "#A9B3CC"
         win = tk.Toplevel(self._root)
         self._console = win
         win.title("Yeelight Ambilight - debug console")
-        win.geometry("900x420")
-        top = ttk.Frame(win, padding=(8, 8, 8, 0))
-        top.pack(fill="x")
-        self._status_label = ttk.Label(top, text="")
+        win.configure(bg=LINE, padx=1, pady=1)                      # 1 px border
+        win.overrideredirect(True)                                  # our own title strip instead of Windows'
+        inner = tk.Frame(win, bg=BG)
+        inner.pack(fill="both", expand=True)
+        drag = Dragger(win)
+        family = "Segoe UI"
+
+        def close(_event=None):
+            win.destroy()
+            self._console = None
+
+        strip = tk.Frame(inner, bg=BG)
+        strip.pack(fill="x")
+        title = tk.Label(strip, text="Debug console", bg=BG, fg=TEXT, font=(family, 11, "bold"), padx=16, pady=10)
+        title.pack(side="left")
+        x_button = tk.Label(strip, text="\u2715", bg=BG, fg=MUTED, font=(family, 11), padx=14, pady=10, cursor="hand2")
+        x_button.pack(side="right")
+        x_button.bind("<Button-1>", close)
+        x_button.bind("<Enter>", lambda _e: x_button.config(bg="#3B1F26", fg="#F87171"))
+        x_button.bind("<Leave>", lambda _e: x_button.config(bg=BG, fg=MUTED))
+        for widget in (strip, title):
+            widget.bind("<Button-1>", drag.press)
+            widget.bind("<B1-Motion>", drag.move)
+
+        bar = tk.Frame(inner, bg=BG, padx=16)
+        bar.pack(fill="x", pady=(0, 8))
+        self._status_label = tk.Label(bar, text="", bg=BG, fg=MUTED, font=(family, 9))
         self._status_label.pack(side="left")
-        ttk.Button(top, text="Save...", command=self._save_log).pack(side="right", padx=(4, 0))
-        ttk.Button(top, text="Copy", command=self._copy_log).pack(side="right", padx=4)
-        ttk.Button(top, text="Clear", command=self._clear_log).pack(side="right")
-        body = ttk.Frame(win, padding=8)
-        body.pack(fill="both", expand=True)
-        text = tk.Text(body, wrap="none", font=("Consolas", 9), state="disabled")
-        bar = ttk.Scrollbar(body, command=text.yview)
-        text.config(yscrollcommand=bar.set)
-        bar.pack(side="right", fill="y")
-        text.pack(side="left", fill="both", expand=True)
+        for label, command in (("Save...", self._save_log), ("Copy", self._copy_log), ("Clear", self._clear_log)):
+            tk.Button(bar, text=label, command=command, bg=TRACK, fg=TEXT, activebackground=LINE,
+                      activeforeground=TEXT, bd=0, padx=12, pady=3, font=(family, 9),
+                      cursor="hand2").pack(side="right", padx=(6, 0))
+        body = tk.Frame(inner, bg=BG, padx=16)
+        body.pack(fill="both", expand=True, pady=(0, 16))
+        text = tk.Text(body, wrap="none", font=("Consolas", 9), state="disabled", bg="#0B101D", fg="#D6DCEB",
+                       insertbackground=TEXT, bd=0, highlightthickness=1, highlightbackground=LINE,
+                       padx=10, pady=8, width=110, height=24)
+        text.pack(fill="both", expand=True)
         self._console_text = text
         self._console_seen = 0.0
-        win.protocol("WM_DELETE_WINDOW", lambda: (win.destroy(), setattr(self, "_console", None)))
+        center(win, 900, 470)
+        round_corners(win)
         self._refresh_console()
 
     def _refresh_console(self) -> None:
