@@ -29,7 +29,7 @@ from PIL import Image
 import yeelight_lan as lan
 
 VERSION = "0.5.0-dev"
-BUILD = "r11 engine + tray preview"   # printed at start so you can tell which file is running
+BUILD = "r12 zone reach + session end"   # printed at start so you can tell which file is running
 
 RGBf = Tuple[float, float, float]
 
@@ -52,6 +52,8 @@ class Config:
                                       # segment command; power-off waits this long after the last frame
 
     center_overlap: float = 0.08      # L/R overlap around the middle
+    zone_reach: float = 0.7           # share of each half (from the center outward) that is sampled;
+                                      # the outer edges, where game HUDs live, are ignored
 
     # brightness (global, 1..100)
     adaptive_brightness: bool = False  # EXPERIMENTAL: the lamp ignores bg_set_bright for ~1 s after every
@@ -76,7 +78,9 @@ class Config:
     luma_cut: float = 70.0            # luma jump that bypasses smoothing
 
     # dark scenes
-    black_threshold: float = 7.0
+    black_threshold: float = 7.0      # both sides at or below this: the whole light switches off
+    side_dark_threshold: float = 7.0  # a single side at or below this brightness is shown dark ((0,0,0))
+    side_wake_threshold: float = 12.0 # ...and lights up again above this (kept at least 4 above the former)
     min_lit_fraction: float = 0.2     # a side with less than this share of lit columns counts as dark
     lit_hysteresis: float = 0.1       # ...and needs this much more to light up again
     wake_threshold: float = 12.0
@@ -85,6 +89,7 @@ class Config:
 
     # the bar's front (desk) light is separate from the rear RGB light
     main_light: str = "leave"        # leave | on | off  (applied once at start)
+    front_off_on_exit: bool = True   # switch the front (desk) light off too when the program stops
 
     # diagnostics
     poll_state: bool = False          # --debug: poll the lamp's real state every 5 s
@@ -106,11 +111,13 @@ class Zones:
     lit_right: float
 
 
-def analyze_zones(img: Image.Image, overlap: float, lit_threshold: float = 12.0) -> Zones:
+def analyze_zones(img: Image.Image, overlap: float, lit_threshold: float = 12.0, reach: float = 1.0) -> Zones:
     """Average color and lit share of the left and right zone, using one BOX resize.
 
-    The zones meet at the center of the captured monitor and overlap by `overlap`
-    (a share of the width). 64 columns keep that overlap close to the configured value.
+    The zones meet at the center of the captured monitor and overlap by `overlap` (a share of the
+    width). Each zone extends `reach` (a share of its half) away from the center, so the outer
+    edges of the screen, where game HUDs live, are ignored. 64 columns keep the geometry close
+    to the settings.
     """
     small = img.resize((GRID_COLS, GRID_ROWS), Image.Resampling.BOX)
     data = small.tobytes()
@@ -127,7 +134,8 @@ def analyze_zones(img: Image.Image, overlap: float, lit_threshold: float = 12.0)
 
     half = GRID_COLS // 2
     ov = max(0, round(GRID_COLS * overlap / 2))
-    left_cols, right_cols = cols[: half + ov], cols[half - ov:]
+    reach_cols = max(1, min(half, round(half * reach)))
+    left_cols, right_cols = cols[half - reach_cols: half + ov], cols[half - ov: half + reach_cols]
 
     def mean(part):
         n = len(part)
@@ -220,9 +228,11 @@ class Pipeline:
         raw_luma = cfg.luma_mix * top + (1 - cfg.luma_mix) * (side_max[0] + side_max[1]) / 2
         # A side is dark when it is black, or when only a small part of it is lit. The lamp cannot
         # dim a color, so a thin lit sliver must not light a whole side at full brightness.
-        inst_dark = [side_max[i] <= cfg.black_threshold or lit[i] < cfg.min_lit_fraction
+        side_wake = max(cfg.side_wake_threshold, cfg.side_dark_threshold + 4.0)
+        inst_dark = [side_max[i] <= cfg.side_dark_threshold or lit[i] < cfg.min_lit_fraction
                      for i in (0, 1)]
-        dark = all(inst_dark)
+        # the whole light switches off only when both sides are really black
+        dark = all(side_max[i] <= cfg.black_threshold or lit[i] < cfg.min_lit_fraction for i in (0, 1))
         wake_level = cfg.min_lit_fraction + cfg.lit_hysteresis
         self.last_top = top
         self.last_lit = lit
@@ -259,7 +269,7 @@ class Pipeline:
             # a dark side is shown as (0,0,0), which the lamp renders as no light; the lamp
             # ignores color brightness otherwise, so this is the only way to darken one side
             if self.side_dark[i]:
-                if side_max[i] > cfg.wake_threshold and lit[i] >= wake_level:
+                if side_max[i] > side_wake and lit[i] >= wake_level:
                     self.side_dark[i] = False
                     self.chroma[i] = None      # snap to the new color
             elif inst_dark[i]:
@@ -346,6 +356,9 @@ class Sender(threading.Thread):
         self._jobs: Deque[Tuple[str, Callable[[lan.LampTCP], bool], int]] = collections.deque()
         self._job_lock = threading.Lock()
         self._job_next = 0.0
+        self.solid: Optional[Tuple[int, int]] = None      # (packed RGB, brightness) = static color mode
+        self._solid_done: Optional[Tuple[int, int]] = None
+        self._solid_next = 0.0
 
     def take_latency(self) -> Tuple[float, float]:
         """Average and maximum software latency (ms) of changed frames since the last call."""
@@ -425,6 +438,7 @@ class Sender(threading.Thread):
                     raise ConnectionError("bg_set_power was not acknowledged")
                 self.power_actual = True
                 self.off_tries = 0
+                self._solid_done = None
                 self.log("[sender] bg_set_power on acknowledged")
                 # a UDP session opened before a power change may be dropped by the lamp
                 self.conn.udp.open()
@@ -433,6 +447,14 @@ class Sender(threading.Thread):
             elif self._try_power_off(now):
                 self.power_actual = False
                 self._force_resend()
+
+        if self.solid is None and self._solid_done is not None:     # back to Ambilight: stream again
+            self._solid_done = None
+            self._force_resend()
+        if self.power_actual and out.power and self.solid is not None:
+            self._apply_solid(now)
+            self._housekeeping(now)
+            return
 
         if self.power_actual and out.power and now - self.last_udp >= cfg.udp_gap_s:
             udp = self.conn.udp
@@ -461,6 +483,26 @@ class Sender(threading.Thread):
                 self.frames += 1
 
         self._housekeeping(now)
+
+    def _apply_solid(self, now: float) -> None:
+        """Static color: plain TCP commands (the lamp honours brightness when no frames stream)."""
+        target = self.solid
+        if target == self._solid_done or now < self._solid_next:
+            return
+        if now - self.last_seg_t < self.cfg.lock_s:      # wait until the last color frame is forgotten
+            return
+        color, bright = target
+        tcp = self.conn.tcp
+        ok = _ok(tcp.call("bg_set_rgb", [color, "sudden", 0], timeout=2.0))
+        ok = ok and _set_and_check(tcp, "bg_set_bright", [bright, "sudden", 0], "bg_bright", bright)
+        if ok:
+            self._solid_done = target
+            self._solid_next = now + 0.3
+            self.last_seg = None
+            self.log(f"[sender] solid color #{color:06x}, brightness {bright}: done")
+        else:
+            self._solid_next = now + 1.0
+            self.log("[sender] solid color was not accepted, trying again")
 
     def _try_power_off(self, now: float) -> bool:
         """Switch the rear light off, the way the lamp allows it.
@@ -539,9 +581,26 @@ class Sender(threading.Thread):
                     if self.conn.tcp.set_power(False) and self._verify_off():
                         break
                     time.sleep(self.cfg.lock_s)
+            if self.cfg.front_off_on_exit:
+                self._front_off()
         except (OSError, AttributeError):
             pass
         self.conn.close()
+
+    def _front_off(self) -> None:
+        """Switch the front (desk) light off. `power` is the combined flag, so it reads off when both are off."""
+        for _ in range(3):
+            wait = self.cfg.lock_s - (time.monotonic() - self.last_seg_t)
+            if wait > 0:
+                time.sleep(wait)
+            self.conn.tcp.call("set_power", ["off", "sudden", 0], timeout=2.0)
+            reply = self.conn.tcp.call("get_prop", ["power"], timeout=1.0)
+            result = reply.get("result") if reply else None
+            if isinstance(result, list) and result and result[0] == "off":
+                self.log("[sender] the front light is off")
+                return
+            time.sleep(self.cfg.lock_s)
+        self.log("[sender] could not confirm that the front light is off")
 
 
 # ============================================================
@@ -667,6 +726,10 @@ class Engine:
         self.sender: Optional[Sender] = None
         self.stats: Dict[str, float] = {"capture_fps": 0.0, "lamp_fps": 0.0, "sw_avg": 0.0, "sw_max": 0.0}
         self._ambilight_on = True
+        self.rear_mode = "ambilight"                # or "solid"
+        self.solid_color = 0x4F6BFF
+        self.solid_bright = 80
+        self.last_colors = (0, 0)                    # (left, right) packed RGB as sent to the lamp
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -799,6 +862,14 @@ class Engine:
         active = True
         while not self._stop.is_set():
             t0 = time.monotonic()
+            sender.solid = ((self.solid_color, self.solid_bright)
+                            if self.rear_mode == "solid" and self._ambilight_on else None)
+            if self.rear_mode == "solid" and self._ambilight_on:     # static color: no capturing
+                active = False
+                sender.submit(Output(True, 0, 0, self.solid_bright, t0))
+                self.last_colors = (self.solid_color, self.solid_color)
+                self._stop.wait(0.1)
+                continue
             if not self._ambilight_on:            # paused from the outside: the rear light goes off
                 active = False
                 sender.submit(Output(False, 0, 0, cfg.bright_max, t0))
@@ -826,9 +897,11 @@ class Engine:
                     self.log(f"[save-strip] cannot write {self.save_strip}: {exc}. "
                              "Use a writable path, e.g. %TEMP%\\strip.png")
                     self.save_strip = None
-            zones = analyze_zones(img, cfg.center_overlap, cfg.wake_threshold)
+            zones = analyze_zones(img, cfg.center_overlap, max(cfg.wake_threshold, cfg.side_dark_threshold),
+                                  cfg.zone_reach)
             out = pipeline.process(zones.left, zones.right, t0, (zones.lit_left, zones.lit_right))
             sender.submit(out)
+            self.last_colors = (out.left, out.right) if out.power else (0, 0)
 
             cost = time.monotonic() - t0
             stat_frames += 1
@@ -861,6 +934,19 @@ class Engine:
         """Ambilight on: the rear light follows the screen. Off: the rear light is switched off."""
         self._ambilight_on = bool(on)
         self.log(f"Ambilight {'on' if on else 'off'}")
+
+    def set_rear_mode(self, mode: str) -> None:
+        """"ambilight" follows the screen; "solid" shows one static color."""
+        self.rear_mode = "solid" if mode == "solid" else "ambilight"
+        self.log(f"Rear light mode: {self.rear_mode}")
+
+    def set_solid_color(self, rgb: int) -> None:
+        self.solid_color = int(rgb) & 0xFFFFFF
+        self.log(f"Solid color #{self.solid_color:06x}")
+
+    def set_solid_brightness(self, value: int) -> None:
+        self.solid_bright = int(clamp(value, 1, 100))
+        self.log(f"Solid color brightness {self.solid_bright}")
 
     def _job(self, label: str, fn: Callable[[lan.LampTCP], bool]) -> bool:
         sender = self.sender

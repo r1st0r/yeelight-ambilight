@@ -10,6 +10,7 @@ for about 1.5 s (the lamp ignores such commands while segment colors arrive).
 """
 
 import json
+import math
 import os
 import queue
 import threading
@@ -21,12 +22,14 @@ try:
 except ImportError:                      # tkinter missing: the tray still works without windows
     tk = None
 
-DEFAULTS = {"front_bright": 100, "front_ct": 4000}
+DEFAULTS = {"front_bright": 100, "front_ct": 4000, "front_on": True,
+            "rear_mode": "ambilight", "solid_color": "#4F6BFF", "solid_bright": 80}
 
 
 class Panel:
-    def __init__(self, engine, settings_path=None):
+    def __init__(self, engine, settings_path=None, on_change=None):
         self.engine = engine
+        self.on_change = on_change
         self.settings_path = settings_path
         self.values = dict(DEFAULTS)
         self._load()
@@ -48,11 +51,22 @@ class Panel:
         try:
             with open(self.settings_path, encoding="utf-8") as fh:
                 data = json.load(fh)
-            for key in ("front_bright", "front_ct"):
+            for key in ("front_bright", "front_ct", "solid_bright"):
                 if isinstance(data.get(key), int):
                     self.values[key] = data[key]
+            if isinstance(data.get("front_on"), bool):
+                self.values["front_on"] = data["front_on"]
+            if data.get("rear_mode") in ("ambilight", "solid"):
+                self.values["rear_mode"] = data["rear_mode"]
+            color = data.get("solid_color")
+            if isinstance(color, str) and len(color) == 7 and color.startswith("#"):
+                int(color[1:], 16)                                  # ValueError if it is not a color
+                self.values["solid_color"] = color.upper()
         except (OSError, ValueError, TypeError):
             pass
+        self.engine.set_rear_mode(self.values["rear_mode"])
+        self.engine.set_solid_color(int(self.values["solid_color"][1:], 16))
+        self.engine.set_solid_brightness(self.values["solid_bright"])
 
     def _save(self) -> None:
         if not self.settings_path:
@@ -114,57 +128,46 @@ class Panel:
 
     # ----- controls window -------------------------------------------------
     def _open_controls(self) -> None:
-        if self._controls is not None and self._controls.winfo_exists():
-            self._controls.deiconify()
-            self._controls.lift()
+        if self._controls is not None and self._controls.win.winfo_exists():
+            self._controls.show()
             return
-        win = tk.Toplevel(self._root)
-        self._controls = win
-        win.title("Yeelight Ambilight")
-        win.resizable(False, False)
-        win.attributes("-topmost", True)
-        frame = ttk.Frame(win, padding=14)
-        frame.grid()
+        from control_window import ControlWindow
+        self._controls = ControlWindow(self, self._root)
 
-        rows = [
-            ("Front light brightness", "front_bright", 1, 100, "%", self.engine.set_front_brightness),
-            ("Front light temperature", "front_ct", 2700, 6500, " K", self.engine.set_front_ct),
-        ]
-        for row, (title, key, low, high, unit, apply) in enumerate(rows):
-            ttk.Label(frame, text=title).grid(row=row * 2, column=0, sticky="w")
-            shown = ttk.Label(frame, width=8, anchor="e")
-            shown.grid(row=row * 2, column=1, sticky="e")
-            var = tk.IntVar(value=int(self.values[key]))
-            shown.config(text=f"{var.get()}{unit}")
+    def _toggle_rear(self, state: bool) -> None:
+        self.engine.set_ambilight(state)
+        if self.on_change:
+            self.on_change()
 
-            def on_move(_v, var=var, shown=shown, unit=unit):
-                shown.config(text=f"{int(float(_v))}{unit}")
+    def set_mode(self, mode: str) -> None:
+        self.values["rear_mode"] = mode
+        self.engine.set_rear_mode(mode)
+        self._save()
+        if self.on_change:
+            self.on_change()
 
-            scale = ttk.Scale(frame, from_=low, to=high, variable=var, length=300, command=on_move)
-            scale.grid(row=row * 2 + 1, column=0, columnspan=2, pady=(0, 10))
-            scale.bind("<ButtonRelease-1>", lambda _e, key=key, var=var, apply=apply: self._commit(key, var, apply))
-            scale.bind("<KeyRelease>", lambda _e, key=key, var=var, apply=apply: self._commit(key, var, apply))
+    def set_solid_color(self, hex_color: str) -> None:
+        self.values["solid_color"] = hex_color.upper()
+        self.engine.set_solid_color(int(hex_color[1:], 16))
+        self._save()
 
-        ttk.Label(frame, foreground="#666",
-                  text="Applied on release; the colors pause for about 1.5 s.").grid(
-            row=4, column=0, columnspan=2, sticky="w")
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=5, column=0, columnspan=2, pady=(10, 0), sticky="e")
-        ttk.Button(buttons, text="Debug console", command=self._open_console).pack(side="left", padx=4)
-        ttk.Button(buttons, text="Close", command=win.withdraw).pack(side="left")
-        win.protocol("WM_DELETE_WINDOW", win.withdraw)
+    def _toggle_front(self, state: bool) -> None:
+        self.values["front_on"] = bool(state)
+        self.engine.set_front_power(state)
+        self._save()
+        if self.on_change:
+            self.on_change()
 
-    def _commit(self, key, var, apply) -> None:
+    def _commit(self, key, value, apply) -> None:
         """Wait 300 ms after the last change, then send it: several sliders share one pause."""
-        value = int(round(var.get()))
-        self.values[key] = value
+        self.values[key] = int(value)
         job = self._apply_after.pop(key, None)
         if job is not None:
             self._root.after_cancel(job)
 
         def fire():
             self._apply_after.pop(key, None)
-            apply(value)
+            apply(int(value))
             self._save()
 
         self._apply_after[key] = self._root.after(300, fire)

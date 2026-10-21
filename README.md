@@ -15,7 +15,7 @@ The program captures the top strip of your screen and mirrors its colors to the 
 * Real-time transport over the lamp's UDP session
 * Optional control of the bar's front (desk) light
 * Optional `config.json`
-* Tray application (preview, Windows): an icon in the notification area with Ambilight on/off, front light on/off, start with Windows
+* Tray application (preview, Windows): a lamp-miniature icon in the notification area (no status marks, the status is shown in the window); a double click opens a control window with switches for the front light and the backlight and sliders for the front light's brightness and color temperature; the menu has start with Windows, debug console, open log and quit
 * Built-in diagnostics (`--debug`, `--trace`, `--save-strip`) and a separate `probe.py` measuring tool
 
 ## Project files
@@ -24,8 +24,12 @@ The program captures the top strip of your screen and mirrors its colors to the 
 | --- | --- |
 | `yeelight_ambilight.py` | Command-line program |
 | `tray_app.py` | Tray application (preview) |
-| `build_exe.bat` | Builds `dist\YeelightAmbilight.exe` with PyInstaller (Windows) |
-| `panel.py` | Sliders window and debug console opened from the tray |
+| `build_exe.bat` | Builds `dist\YeelightAmbilight.exe` and `dist\uninstall.exe` with PyInstaller (Windows) |
+| `uninstall.py` | Uninstaller: removes autostart, settings, log and the remembered lamp address |
+| `panel.py` | Window thread: opens the control window and the debug console from the tray |
+| `control_window.py` | The control window (lamp picture with live colors, front light and backlight cards) |
+| `color_picker.py` | Color picker dialog (palette, hue bar, hex and R/G/B fields) |
+| `stage.py`, `lamp_png.py` | Drawing of the glowing lamp picture (Pillow) and the lamp image itself |
 | `ambilight_core.py` | The engine: screen analysis, color pipeline, sender, and the controllable `Engine` class |
 | `yeelight_lan.py` | Lamp discovery, TCP and UDP clients |
 | `probe.py` | Measuring tool for the lamp's behavior |
@@ -86,7 +90,13 @@ The icon shows the state (the two halves follow the screen when it runs, gray wh
 | Open log | Opens `%LOCALAPPDATA%\YeelightAmbilight\ambilight.log` |
 | Quit | Stops the program and switches the rear light off (takes about a second and a half) |
 
-When Windows shuts down, restarts or logs off, the tray application switches the rear light off (a hidden window listens for the end-of-session message; the log shows `[tray] Windows is ending the session`). Only one instance can run at a time. Options are the same as for the command line (`--config`, `--ip`, `--bright-max`, `--debug`, and so on). Brightness and color temperature sliders and a console window are planned (see the roadmap). This is a first version, not yet verified on a real Windows setup.
+When Windows shuts down, restarts or logs off, the tray application switches both lights off (a hidden window listens for the end-of-session message; the log shows `[tray] Windows is ending the session`). Only one instance can run at a time. Options are the same as for the command line (`--config`, `--ip`, `--bright-max`, `--debug`, and so on). A double click on the icon opens the control window (rear and front light switches, front brightness and color temperature); the right-click menu has only *Start with Windows*, *Debug console*, *Open log* and *Quit*. The window follows the design file: the lamp picture glows in the live colors of the screen (left and right) and in the front light's color temperature, with two cards below. Front light: switch, brightness, temperature. Backlight: switch and a mode switch *Ambilight / Solid color*. *Ambilight* shows the live colors of the screen; *Solid color* shows one static color: six ready colors, a **+** button for any color (palette, hex or R/G/B) and a brightness slider. In solid mode the screen is not captured and brightness works, because no color frames stream (the lamp resets brightness while they do). The mode, the color and the brightness are remembered. Built and run as an exe on Windows; the shutdown behaviour is still to be verified.
+
+## Updating and uninstalling (exe)
+
+**Update:** right-click the tray icon, *Quit*; replace the project files with the new ones; run `build_exe.bat`; start `dist\YeelightAmbilight.exe`. Settings (`ui_settings.json`, the log) live in `%LOCALAPPDATA%\YeelightAmbilight` and are kept. If *Start with Windows* was on, switch it off and on once so the entry points at the new exe path.
+
+**Uninstall:** *Quit* from the tray, then run `dist\uninstall.exe`. It removes the autostart entry, the remembered lamp address and (after asking) the settings and the log. Then delete the program folder by hand.
 
 ## Finding the lamp
 
@@ -181,6 +191,7 @@ Command-line options override the file. Unknown keys stop the program with an er
 | `tau_slow` | `0.15` | Color smoothing time for slow changes, in seconds |
 | `tau_fast` | `0.02` | Color smoothing time for fast changes, in seconds |
 | `cut_distance` | `60.0` | Color change that counts as a fast scene |
+| `front_off_on_exit` | `true` | Also switch the front (desk) light off when the program quits or Windows shuts down. Set `false` to leave it as it is |
 | `black_threshold` | `7.0` | Both sides at or below this brightness: the whole light switches off after `dark_hold_s` |
 | `side_dark_threshold` | `7.0` | A single side at or below this brightness is shown dark. Raise it (for example to 25) to darken dim scenes |
 | `side_wake_threshold` | `12.0` | A dark side lights up again above this (always kept at least 4 above `side_dark_threshold`) |

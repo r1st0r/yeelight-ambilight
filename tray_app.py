@@ -7,8 +7,8 @@ Starts the Ambilight engine in the background and puts an icon in the notificati
     python tray_app.py            (with a console, for the first try)
     pythonw tray_app.py           (no console window)
 
-Menu: Ambilight on/off, front light on/off, sliders window (rear/front brightness, front color
-temperature; double-click the icon), debug console, start with Windows, open the log, quit.
+Double-click the icon for the control window (rear and front light switches, front brightness and
+color temperature). Menu: start with Windows, debug console, open the log, quit.
 The lamp is switched off when Windows shuts down, restarts or logs off.
 Everything the engine reports is written to %LOCALAPPDATA%\\YeelightAmbilight\\ambilight.log.
 """
@@ -134,25 +134,23 @@ def set_autostart(enabled: bool, config_path=None) -> None:
                 pass
 
 
-ICON_COLORS = {
-    "running": ((255, 140, 0), (0, 170, 255)),      # the two halves follow the screen
-    "paused": ((120, 120, 120), (120, 120, 120)),
-    "connecting": ((230, 200, 40), (230, 200, 40)),
-    "problem": ((220, 60, 60), (220, 60, 60)),
-}
-
-
-def make_icon(kind: str):
-    """A small picture of the light bar: two halves, colored by state."""
-    left, right = ICON_COLORS.get(kind, ICON_COLORS["problem"])
-    size = 64
-    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+def make_icon():
+    """A miniature of the light bar (no status marks: the status lives in the app window)."""
+    big = 256
+    bar = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(bar)
+    for y in range(44, 132):                                  # the brushed-metal bar: light on top, darker below
+        shade = int(236 - 80 * (y - 44) / 88.0)
+        draw.line((8, y, 248, y), fill=(shade, shade + 2, shade + 6, 255))
+    mask = Image.new("L", (big, big), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((8, 44, 248, 132), radius=30, fill=255)
+    image = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+    image.paste(bar, (0, 0), mask)
     draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((3, 14, 61, 50), radius=9, fill=(32, 32, 36, 255))
-    draw.rectangle((8, 20, 31, 44), fill=left + (255,))
-    draw.rectangle((33, 20, 56, 44), fill=right + (255,))
-    return image
-
+    draw.rounded_rectangle((32, 100, 224, 118), radius=9, fill=(255, 248, 225, 255))      # the glowing edge
+    draw.rounded_rectangle((92, 132, 164, 220), radius=12, fill=(118, 124, 138, 255))     # the clamp
+    draw.rounded_rectangle((92, 132, 164, 156), radius=8, fill=(160, 166, 180, 255))
+    return image.resize((64, 64), Image.LANCZOS)
 
 
 class SessionEndWatcher:
@@ -278,19 +276,11 @@ class TrayApp:
             "stopped": "Stopped",
         }.get(status, status)
 
-    def icon_kind(self) -> str:
-        status = self.engine.status
-        if status == "running":
-            return "running" if self.engine.ambilight_on else "paused"
-        return "connecting" if status == "connecting" else "problem"
-
     def refresh(self) -> None:
         icon = self.icon
         if icon is None:
             return
         try:
-            icon.icon = make_icon(self.icon_kind())
-            icon.title = f"Yeelight Ambilight: {self.status_text()}"
             icon.update_menu()
         except Exception:
             pass
@@ -331,10 +321,17 @@ class TrayApp:
     def quit(self, icon=None, item=None) -> None:
         threading.Thread(target=self._shutdown, daemon=True).start()
 
+    def stop_lamp(self) -> None:
+        """Stops the engine: both lights go off, and the window remembers that the front light is off."""
+        if self.panel and self.engine.cfg.front_off_on_exit:
+            self.panel.values["front_on"] = False
+            self.panel._save()
+        self.engine.stop()                            # switches the lights off, takes a moment
+
     def _shutdown(self) -> None:
         if self.panel:
             self.panel.close()
-        self.engine.stop()                            # switches the rear light off, takes a moment
+        self.stop_lamp()
         if self.icon is not None:
             self.icon.stop()
 
@@ -342,14 +339,7 @@ class TrayApp:
     def build_menu(self):
         item = pystray.MenuItem
         return pystray.Menu(
-            item(lambda _: f"Yeelight Ambilight {VERSION}", None, enabled=False),
-            item(lambda _: f"Status: {self.status_text()}", None, enabled=False),
-            pystray.Menu.SEPARATOR,
-            item("Ambilight", self.toggle_ambilight, checked=lambda _: self.engine.ambilight_on),
-            item("Front light on", self.front_on),
-            item("Front light off", self.front_off),
-            item("Brightness and temperature...", self.open_controls, default=True),
-            pystray.Menu.SEPARATOR,
+            item("Open", self.open_controls, default=True, visible=False),      # double-click on the icon
             item("Start with Windows", self.toggle_autostart, checked=lambda _: autostart_enabled()),
             item("Debug console", self.open_console),
             item("Open log", self.open_log),
@@ -357,8 +347,7 @@ class TrayApp:
         )
 
     def run(self) -> None:
-        self.icon = pystray.Icon(APP_NAME, make_icon(self.icon_kind()),
-                                 f"Yeelight Ambilight: {self.status_text()}", self.build_menu())
+        self.icon = pystray.Icon(APP_NAME, make_icon(), "Yeelight Ambilight", self.build_menu())
         self.icon.run()                               # blocks until icon.stop()
 
 
@@ -391,11 +380,12 @@ def main() -> None:
     log(f"=== Yeelight Ambilight tray {VERSION} ({BUILD}) ===")
     engine = Engine(cfg, log=log)
     engine.debug = args.debug
-    panel = Panel(engine, SETTINGS_FILE)
-    app = TrayApp(engine, args.config, panel)
+    app = TrayApp(engine, args.config)
+    panel = Panel(engine, SETTINGS_FILE, on_change=app.refresh)
+    app.panel = panel
     engine.status_cb = app.on_status
     engine.start()
-    SessionEndWatcher(on_ending=engine.stop,
+    SessionEndWatcher(on_ending=app.stop_lamp,
                       on_cancelled=lambda: (engine.start(), app.refresh()),
                       log=log).start()
     app.run()
