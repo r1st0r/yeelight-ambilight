@@ -7,7 +7,9 @@ Starts the Ambilight engine in the background and puts an icon in the notificati
     python tray_app.py            (with a console, for the first try)
     pythonw tray_app.py           (no console window)
 
-Menu: Ambilight on/off, front light on/off, start with Windows, open the log, quit.
+Menu: Ambilight on/off, front light on/off, sliders window (rear/front brightness, front color
+temperature; double-click the icon), debug console, start with Windows, open the log, quit.
+The lamp is switched off when Windows shuts down, restarts or logs off.
 Everything the engine reports is written to %LOCALAPPDATA%\\YeelightAmbilight\\ambilight.log.
 """
 
@@ -26,11 +28,13 @@ except ImportError:          # reported properly in main()
     Image = ImageDraw = None
 
 from ambilight_core import BUILD, VERSION, Engine, load_config
+from panel import Panel
 
 APP_NAME = "YeelightAmbilight"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_NAME)
 LOG_FILE = os.path.join(LOG_DIR, "ambilight.log")
+SETTINGS_FILE = os.path.join(LOG_DIR, "ui_settings.json")
 
 _mutex_handle = None         # keeps the single-instance mutex alive
 
@@ -80,6 +84,11 @@ def already_running() -> bool:
 
 def launch_command(config_path=None) -> str:
     """The command line that starts this application at login (pythonw: no console window)."""
+    if getattr(sys, "frozen", False):                 # built with PyInstaller: the exe is the program
+        command = f'"{sys.executable}"'
+        if config_path:
+            command += f' --config "{os.path.abspath(config_path)}"'
+        return command
     exe = sys.executable
     if exe.lower().endswith("python.exe"):
         candidate = exe[: -len("python.exe")] + "pythonw.exe"
@@ -145,13 +154,115 @@ def make_icon(kind: str):
     return image
 
 
+
+class SessionEndWatcher:
+    """Switches the lamp off when Windows shuts down, restarts or logs off.
+
+    Windows tells every top-level window about that with WM_QUERYENDSESSION and WM_ENDSESSION;
+    a program without such a window (like this one under pythonw) is simply terminated and the
+    lamp keeps shining. So a hidden window listens for the messages and runs `on_ending`
+    (stop the engine, which switches the rear light off) while Windows waits for it.
+    """
+
+    WM_QUERYENDSESSION = 0x0011
+    WM_ENDSESSION = 0x0016
+
+    def __init__(self, on_ending, on_cancelled, log):
+        self.on_ending = on_ending
+        self.on_cancelled = on_cancelled
+        self.log = log
+        self._worker = None
+
+    def start(self) -> None:
+        if os.name == "nt":
+            threading.Thread(target=self._run, name="session-watcher", daemon=True).start()
+
+    def _run(self) -> None:
+        try:
+            self._loop()
+        except Exception as exc:          # the lamp then simply stays as it is at shutdown
+            self.log(f"[tray] the shutdown watcher failed: {exc!r}")
+
+    def _loop(self) -> None:
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        lresult = ctypes.c_ssize_t
+        wndproc_type = ctypes.WINFUNCTYPE(lresult, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", wndproc_type),
+                        ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                        ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HANDLE),
+                        ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HANDLE),
+                        ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR)]
+
+        user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.DefWindowProcW.restype = lresult
+        user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+        user32.RegisterClassW.restype = wintypes.ATOM
+        user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                                           ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                           wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+        user32.GetMessageW.restype = ctypes.c_int
+        user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.DispatchMessageW.restype = lresult
+        user32.ShutdownBlockReasonCreate.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+        user32.ShutdownBlockReasonDestroy.argtypes = [wintypes.HWND]
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
+
+        def wndproc(hwnd, msg, wparam, lparam):
+            try:
+                if msg == self.WM_QUERYENDSESSION:
+                    self.log("[tray] Windows is ending the session: switching the lamp off")
+                    user32.ShutdownBlockReasonCreate(hwnd, "Switching the lamp off")
+                    self._worker = threading.Thread(target=self.on_ending, daemon=True)
+                    self._worker.start()
+                    return 1                                  # TRUE: do not veto the shutdown
+                if msg == self.WM_ENDSESSION:
+                    if wparam:                                # the session really ends
+                        if self._worker is not None:
+                            self._worker.join(4.5)            # Windows terminates us right after this
+                        self.log("[tray] session end: the lamp has been switched off")
+                    else:                                     # the shutdown was cancelled
+                        self.log("[tray] the shutdown was cancelled: starting again")
+                        self.on_cancelled()
+                    user32.ShutdownBlockReasonDestroy(hwnd)
+                    return 0
+            except Exception as exc:
+                self.log(f"[tray] session message handler: {exc!r}")
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        proc = wndproc_type(wndproc)                          # must stay referenced
+        hinstance = kernel32.GetModuleHandleW(None)
+        wc = WNDCLASSW()
+        wc.lpfnWndProc = proc
+        wc.hInstance = hinstance
+        wc.lpszClassName = "YeelightAmbilightSessionWatcher"
+        if not user32.RegisterClassW(ctypes.byref(wc)):
+            raise ctypes.WinError()
+        hwnd = user32.CreateWindowExW(0, wc.lpszClassName, "Yeelight Ambilight", 0, 0, 0, 0, 0,
+                                      None, None, hinstance, None)
+        if not hwnd:
+            raise ctypes.WinError()
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
 # ----------------------------------------------------------------------
 # The application
 # ----------------------------------------------------------------------
 
 class TrayApp:
-    def __init__(self, engine, config_path=None):
+    def __init__(self, engine, config_path=None, panel=None):
         self.engine = engine
+        self.panel = panel
         self.config_path = config_path
         self.icon = None
 
@@ -205,6 +316,14 @@ class TrayApp:
             self.engine.log(f"[tray] cannot change autostart: {exc}")
         self.refresh()
 
+    def open_controls(self, icon=None, item=None) -> None:
+        if self.panel:
+            self.panel.show_controls()
+
+    def open_console(self, icon=None, item=None) -> None:
+        if self.panel:
+            self.panel.show_console()
+
     def open_log(self, icon=None, item=None) -> None:
         if os.name == "nt" and os.path.exists(LOG_FILE):
             os.startfile(LOG_FILE)                    # noqa: S606 - a file the app itself writes
@@ -213,6 +332,8 @@ class TrayApp:
         threading.Thread(target=self._shutdown, daemon=True).start()
 
     def _shutdown(self) -> None:
+        if self.panel:
+            self.panel.close()
         self.engine.stop()                            # switches the rear light off, takes a moment
         if self.icon is not None:
             self.icon.stop()
@@ -227,8 +348,10 @@ class TrayApp:
             item("Ambilight", self.toggle_ambilight, checked=lambda _: self.engine.ambilight_on),
             item("Front light on", self.front_on),
             item("Front light off", self.front_off),
+            item("Brightness and temperature...", self.open_controls, default=True),
             pystray.Menu.SEPARATOR,
             item("Start with Windows", self.toggle_autostart, checked=lambda _: autostart_enabled()),
+            item("Debug console", self.open_console),
             item("Open log", self.open_log),
             item("Quit", self.quit),
         )
@@ -268,9 +391,13 @@ def main() -> None:
     log(f"=== Yeelight Ambilight tray {VERSION} ({BUILD}) ===")
     engine = Engine(cfg, log=log)
     engine.debug = args.debug
-    app = TrayApp(engine, args.config)
+    panel = Panel(engine, SETTINGS_FILE)
+    app = TrayApp(engine, args.config, panel)
     engine.status_cb = app.on_status
     engine.start()
+    SessionEndWatcher(on_ending=engine.stop,
+                      on_cancelled=lambda: (engine.start(), app.refresh()),
+                      log=log).start()
     app.run()
 
 
