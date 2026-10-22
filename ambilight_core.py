@@ -28,8 +28,7 @@ from PIL import Image
 
 import yeelight_lan as lan
 
-VERSION = "0.5.0-dev"
-BUILD = "r12 zone reach + session end"   # printed at start so you can tell which file is running
+VERSION = "0.5.0"
 
 RGBf = Tuple[float, float, float]
 
@@ -934,6 +933,15 @@ class Engine:
         """Ambilight on: the rear light follows the screen. Off: the rear light is switched off."""
         self._ambilight_on = bool(on)
         self.log(f"Ambilight {'on' if on else 'off'}")
+
+    def set_saturation(self, percent: int) -> None:
+        """Color saturation of the Ambilight, 50..200 % (100 = as captured). Applies at once."""
+        self.cfg.sat_boost = clamp(percent, 50, 200) / 100.0
+
+    def set_smoothness(self, percent: int) -> None:
+        """How slowly colors follow the screen, 0..100 % (21 % = the default 0.15 s). Applies at once."""
+        self.cfg.tau_slow = 0.03 + 0.0057 * clamp(percent, 0, 100)
+        self.cfg.tau_fast = self.cfg.tau_slow * 0.13
 
     def set_rear_mode(self, mode: str) -> None:
         """"ambilight" follows the screen; "solid" shows one static color."""

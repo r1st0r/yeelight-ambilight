@@ -23,7 +23,8 @@ except ImportError:                      # tkinter missing: the tray still works
     tk = None
 
 DEFAULTS = {"front_bright": 100, "front_ct": 4000, "front_on": True,
-            "rear_mode": "ambilight", "solid_color": "#4F6BFF", "solid_bright": 80}
+            "rear_mode": "ambilight", "solid_color": "#4F6BFF", "solid_bright": 80,
+            "saturation": 110, "smoothness": 21}
 
 
 class Panel:
@@ -51,7 +52,7 @@ class Panel:
         try:
             with open(self.settings_path, encoding="utf-8") as fh:
                 data = json.load(fh)
-            for key in ("front_bright", "front_ct", "solid_bright"):
+            for key in ("front_bright", "front_ct", "solid_bright", "saturation", "smoothness"):
                 if isinstance(data.get(key), int):
                     self.values[key] = data[key]
             if isinstance(data.get("front_on"), bool):
@@ -67,6 +68,8 @@ class Panel:
         self.engine.set_rear_mode(self.values["rear_mode"])
         self.engine.set_solid_color(int(self.values["solid_color"][1:], 16))
         self.engine.set_solid_brightness(self.values["solid_bright"])
+        self.engine.set_saturation(self.values["saturation"])
+        self.engine.set_smoothness(self.values["smoothness"])
 
     def _save(self) -> None:
         if not self.settings_path:

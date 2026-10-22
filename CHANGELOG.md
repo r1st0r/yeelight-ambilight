@@ -1,11 +1,12 @@
 # Changelog
 
-## [0.5.0] - unreleased
+## [0.5.0] - 2026-10-21
 
 The first release since 0.3.1. It ships the planned v0.4 and v0.5 work together.
 
 ### Added
 
+* Color profile sliders for the Ambilight (Saturation and Smoothness), applied live and remembered.
 * `front_off_on_exit` (default on): quitting the program or shutting Windows down switches the front light off together with the rear light.
 * Tray application with a control window: front light and backlight switches, front brightness and color temperature, a live lamp picture, a debug console, autostart and lamp-off at Windows shutdown. `build_exe.bat` builds a single exe.
 * Backlight mode *Solid color*: a static color from six presets or any color (picker, hex, R/G/B) with working brightness; *Ambilight* mode shows the live screen colors.
@@ -44,12 +45,12 @@ The first release since 0.3.1. It ships the planned v0.4 and v0.5 work together.
 
 ### Known issues
 
-* One dark half of the screen on the latest zone logic and the end-to-end latency are still to be verified on a real setup.
+* The end-to-end latency (screen to lamp) has not been measured yet; `latency_flash.py` with a phone in slow motion is the way to do it.
 * Reconnect after a real address change has not been tried yet (postponed to v0.7).
-* The brightness of the rear light cannot follow the scene while colors stream.
+* While colors stream the rear light is always at full brightness: a color frame resets it, and the brightness set with `bg_set_bright` only shows about a second after the last frame. Brightness works in the Solid color mode.
 * A dark half is not completely off (a faint glow remains); only switching the whole light off makes it fully dark.
-* The main program has been verified on Windows only.
-* The tray application and the engine's one-off commands were tested against a simulated lamp only.
+* The control window state of the front light is remembered by the app; changing it from the Yeelight app is not reflected.
+* Verified on Windows 11 only.
 
 ## [0.3.1]
 

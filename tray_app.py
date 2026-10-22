@@ -27,7 +27,7 @@ except ImportError:          # reported properly in main()
     pystray = None
     Image = ImageDraw = None
 
-from ambilight_core import BUILD, VERSION, Engine, load_config
+from ambilight_core import VERSION, Engine, load_config
 from icon_art import lamp_layer
 from panel import Panel
 
@@ -364,7 +364,7 @@ def main() -> None:
     cfg.poll_state = args.debug
 
     log = FileLog(LOG_FILE)
-    log(f"=== Yeelight Ambilight tray {VERSION} ({BUILD}) ===")
+    log(f"=== Yeelight Ambilight tray {VERSION} ===")
     engine = Engine(cfg, log=log)
     engine.debug = args.debug
     app = TrayApp(engine, args.config)

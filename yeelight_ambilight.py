@@ -11,7 +11,7 @@ import sys
 
 import yeelight_lan as lan
 from ambilight_core import *  # noqa: F401,F403  (re-exported for scripts and tests)
-from ambilight_core import BUILD, VERSION, Engine, LampUnavailable, load_config
+from ambilight_core import VERSION, Engine, LampUnavailable, load_config
 
 
 def main() -> None:
@@ -42,7 +42,7 @@ def main() -> None:
     lan.TRACE = args.trace
 
     print("=" * 55)
-    print(f"Yeelight Ambilight {VERSION} ({BUILD})")
+    print(f"Yeelight Ambilight {VERSION}")
     print("=" * 55)
     engine = Engine(cfg, log=print)
     engine.debug = args.debug

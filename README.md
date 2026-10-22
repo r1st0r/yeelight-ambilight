@@ -4,7 +4,19 @@ Ambilight-style screen synchronization for the **Yeelight Monitor Light Bar Pro 
 
 The program captures the top strip of your screen and mirrors its colors to the rear RGB light of the bar: the left half of the screen drives the left half of the light, the right half drives the right half. Everything runs locally over your LAN, with no cloud and no account.
 
-> **Status: 0.5.0 (in development).** The planned v0.4 and v0.5 work is in the code and will ship together as 0.5.0. Still to check on a real setup: one dark half of the screen and the end-to-end latency. The automatic reconnect after an address change is implemented, but its real-world check is postponed to v0.7. Developed and tested on Windows 11 with a 3440×1440 monitor and a lamp15 on firmware 38. See [Tested setup](#tested-setup).
+> **Status: 0.5.0.** Left / right color zones, automatic discovery, the tray application with a control window (also as a single exe) and the Solid color mode are in. Not yet measured: the end-to-end latency. The automatic reconnect after an address change is implemented, but its real-world check is planned for v0.7. Developed and tested on Windows 11 with a 3440×1440 monitor and a lamp15 on firmware 38. See [Tested setup](#tested-setup).
+
+## Preview
+
+The control window, opened with a double click on the tray icon. **Ambilight** mode: the glow of the lamp follows the screen, with live colors and the Saturation and Smoothness sliders.
+
+![Control window, Ambilight mode](docs/preview-ambilight.png)
+
+**Solid color** mode: a static color from the presets or any color of your choice, with working brightness.
+
+![Control window, Solid color mode](docs/preview-solid-color.png)
+
+*The pictures are rendered with the window's own drawing code; the fonts on your system may differ a little.*
 
 ## Features
 
@@ -29,6 +41,7 @@ The program captures the top strip of your screen and mirrors its colors to the 
 | `panel.py` | Window thread: opens the control window and the debug console from the tray |
 | `control_window.py` | The control window (lamp picture with live colors, front light and backlight cards) |
 | `color_picker.py` | Color picker dialog (palette, hue bar, hex and R/G/B fields) |
+| `docs/` | Preview pictures used in this README |
 | `icon_art.py`, `icon.ico` | The app icon: a blue rounded square with the lamp (exe, Start menu); `python icon_art.py` recreates `icon.ico` |
 | `winstyle.py` | Frameless windows: rounded corners (Windows 11) and dragging |
 | `stage.py`, `lamp_png.py` | Drawing of the glowing lamp picture (Pillow) and the lamp image itself |
@@ -92,7 +105,7 @@ The icon shows the state (the two halves follow the screen when it runs, gray wh
 | Open log | Opens `%LOCALAPPDATA%\YeelightAmbilight\ambilight.log` |
 | Quit | Stops the program and switches the rear light off (takes about a second and a half) |
 
-When Windows shuts down, restarts or logs off, the tray application switches both lights off (a hidden window listens for the end-of-session message; the log shows `[tray] Windows is ending the session`). Only one instance can run at a time. Options are the same as for the command line (`--config`, `--ip`, `--bright-max`, `--debug`, and so on). A double click on the icon opens the control window (rear and front light switches, front brightness and color temperature); the right-click menu has only *Start with Windows*, *Debug console*, *Open log* and *Quit*. The windows have no standard Windows title bar: they draw their own (drag the top strip to move; the minimize and close buttons hide the window, the program keeps running in the tray). The main window follows the design file: the lamp picture glows in the live colors of the screen (left and right) and in the front light's color temperature, with two cards below. Front light: switch, brightness, temperature. Backlight: switch and a mode switch *Ambilight / Solid color*. *Ambilight* shows the live colors of the screen; *Solid color* shows one static color: six ready colors, a **+** button for any color (palette, hex or R/G/B) and a brightness slider. In solid mode the screen is not captured and brightness works, because no color frames stream (the lamp resets brightness while they do). The mode, the color and the brightness are remembered. Built and run as an exe on Windows; the shutdown behaviour is still to be verified.
+When Windows shuts down, restarts or logs off, the tray application switches both lights off (a hidden window listens for the end-of-session message; the log shows `[tray] Windows is ending the session`). Only one instance can run at a time. Options are the same as for the command line (`--config`, `--ip`, `--bright-max`, `--debug`, and so on). A double click on the icon opens the control window (rear and front light switches, front brightness and color temperature); the right-click menu has only *Start with Windows*, *Debug console*, *Open log* and *Quit*. The windows have no standard Windows title bar: they draw their own (drag the top strip to move; the minimize and close buttons hide the window, the program keeps running in the tray). The main window follows the design file: the lamp picture glows in the live colors of the screen (left and right) and in the front light's color temperature, with two cards below. Front light: switch, brightness, temperature. Backlight: switch and a mode switch *Ambilight / Solid color*. *Ambilight* shows the live colors of the screen with two color profile sliders, **Saturation** (50–200 %, default 110 % = `sat_boost` 1.1) and **Smoothness** (0–100 %, how slowly colors follow the screen, default 21 % = `tau_slow` 0.15 s); both apply while dragging and are remembered; a small *Reset* button appears next to the value when it differs from the default; *Solid color* shows one static color: six ready colors, a **+** button for any color (palette, hex or R/G/B) and a brightness slider. In solid mode the screen is not captured and brightness works, because no color frames stream (the lamp resets brightness while they do). The mode, the color and the brightness are remembered. Built and run as an exe on Windows; the shutdown behaviour is still to be verified.
 
 ## Updating and uninstalling (exe)
 
@@ -134,7 +147,7 @@ Example start-up output:
 
 ```text
 =======================================================
-Yeelight Ambilight 0.5.0-dev (r12 zone reach + session end)
+Yeelight Ambilight 0.5.0
 =======================================================
 Lamp: lamp15 fw 38 192.168.0.50 id 0x0000000012345678
 Capture 60 fps, lamp 30 fps, brightness 60 (fixed)
@@ -379,7 +392,7 @@ The UDP session behavior is described in Yeelight's public *Inter-Operation Spec
 
 ## Roadmap
 
-Current version: **0.5.0-dev**. The v0.4 and v0.5 items below ship together as release 0.5.0.
+Current version: **0.5.0**. The v0.4 and v0.5 items below, together with the tray application and the exe from the v0.7 list, shipped in 0.5.0.
 
 ### v0.4
 
@@ -391,37 +404,37 @@ Current version: **0.5.0-dev**. The v0.4 and v0.5 items below ship together as r
 
 * [x] Improve left / right responsiveness
 * [ ] Reduce color transition latency (capture is about 12 ms per frame and `--debug` shows the software latency; the end-to-end value still has to be measured with `latency_flash.py`)
-* [ ] Better color sampling algorithm (grid sampling with zone overlap is done)
+* [x] Better color sampling algorithm (grid sampling with zone overlap is done)
 * [x] Dark-scene handling: the light switches off after sustained black and back on (verified on the lamp)
-* [ ] Per-side blackout when only one half of the screen is dark (implemented, lit-fraction rule added after a first test; recheck on the lamp)
+* [x] Per-side blackout when only one half of the screen is dark (verified in games and with a white | black split)
 
 ### v0.6
 
 * [x] Config file (`config.json`)
-* [ ] Configurable color profiles
+* [x] Configurable color profiles: Saturation and Smoothness sliders in the Backlight card (named presets can follow)
 * [ ] Multi-monitor support (a single monitor can be selected with `--monitor`)
 * [ ] Device selection when multiple Yeelight devices are detected
 * [ ] Per-monitor lighting zones (zone boundaries relative to each monitor's own center, and the position of the light bar)
 
 ### v0.7
 
-* [ ] Native Windows executable
-* [ ] System tray integration
-* [ ] Auto-start with Windows
-* [ ] Background mode: start at Windows login, no console window (a real Windows service cannot capture the screen). Written, to be verified
+* [x] Native Windows executable
+* [x] System tray integration
+* [x] Auto-start with Windows
+* [x] Background mode: start at Windows login, no console window (a real Windows service cannot capture the screen). Verified after a restart
 * [ ] Automatic reconnection after DHCP IP changes (moved from v0.4: implemented in the engine, a real address change still has to be tried; the tray shows the connection status)
 
 #### Tray application (minimal GUI)
 
 * [x] Core refactor: ambilight engine controllable from outside the CLI (start / stop / status / log events)
-* [ ] Taskbar (notification area) icon with a context menu (first version written, to be verified on Windows)
-* [ ] Ambilight on / off (in the first version)
-* [ ] Power on / off for each light separately: rear (RGB) and front (desk) (in the first version: the Ambilight switch for the rear light, on / off items for the front light)
-* [ ] Sliders in a small popup window opened from the tray: brightness of the front light and the color temperature of the front light (warm to cold white, 2700–6500 K as measured with `probe.py frontct`)
-* [ ] Slider values are applied when the slider is released (the tray menu itself cannot hold a slider). While colors stream, the lamp ignores brightness changes of both lights right after a color frame, so the color stream pauses for about a second and a half while the new value is applied; the color temperature needs the same pause (measured), and changes of several sliders can be applied in one pause
+* [x] Notification area icon with a context menu (start with Windows, debug console, open log, quit)
+* [x] Ambilight on / off
+* [x] Power on / off for each light separately: backlight and front light (switches in the control window); both go off when the program quits or Windows shuts down (verified)
+* [x] Sliders in a small popup window opened from the tray: brightness of the front light and the color temperature of the front light (warm to cold white, 2700–6500 K as measured with `probe.py frontct`)
+* [x] Slider values are applied when the slider is released (the tray menu itself cannot hold a slider). While colors stream, the lamp ignores brightness changes of both lights right after a color frame, so the color stream pauses for about a second and a half while the new value is applied; the color temperature needs the same pause (measured), and changes of several sliders can be applied in one pause
 * [ ] Automatic reconnect after signal loss (Wi-Fi drop, lamp reboot, new DHCP address) with a connection status indicator in the tray
-* [ ] Debug console window: live log (capture FPS, lamp frames/s, errors, real lamp state), copy and save log
-* [ ] GUI toolkit decision (candidate: `pystray` for the tray icon and `tkinter` for the popup and console windows)
+* [x] Debug console window: live log (capture FPS, lamp frames/s, errors, real lamp state), copy and save log
+* [x] GUI toolkit decision (candidate: `pystray` for the tray icon and `tkinter` for the popup and console windows)
 
 ### Research
 

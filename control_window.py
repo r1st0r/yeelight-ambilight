@@ -24,7 +24,7 @@ C_BG, C_CARD, C_LINE, C_TRACK = "#05080F", "#0B101D", "#1A2338", "#1E2840"
 C_TEXT, C_MUTED, C_DIM, C_OK = "#E8ECF7", "#A9B3CC", "#8E99B5", "#4ADE80"
 C_WARN, C_BAD, C_KNOB_OFF, C_RING = "#FBBF24", "#F87171", "#5A6580", "#262A37"
 SWATCHES = ["#4F6BFF", "#8B5CF6", "#EC4899", "#F97316", "#22D3EE", "#F4F6FF"]
-CARD_H = 244
+CARD_H = 300
 
 
 def _unpack(color_int: int):
@@ -259,10 +259,19 @@ class ControlWindow:
                                 outline="", tags="ui")
         self.hits.append((tx0, ty0, tx1, ty1, "toggle", toggle_key))
 
-    def _slider(self, x0, x1, y_label, label, value_text, key, low, high, value, gradient=False):
+    def _slider(self, x0, x1, y_label, label, value_text, key, low, high, value, gradient=False, default=None):
         S, c = self.S, self.canvas
         c.create_text(x0, y_label, text=label, anchor="nw", fill=C_MUTED, font=self.font(13), tags="ui")
         c.create_text(x1, y_label, text=value_text, anchor="ne", fill=C_MUTED, font=self.font(13), tags="ui")
+        if default is not None and value != default:              # a small "Reset" pill left of the value
+            fnt = self.font(11, "bold")
+            bw, bh = fnt.measure("Reset") + S(18), S(22)
+            bx1 = x1 - self.font(13).measure(value_text) - S(12)
+            by0 = y_label - S(3)
+            hot = (self._hover_btn == ("reset", key))
+            self.rrect(bx1 - bw, by0, bx1, by0 + bh, bh / 2, fill=C_LINE if hot else C_TRACK)
+            self.ctext(bx1 - bw / 2, by0 + bh / 2, "Reset", C_TEXT if hot else C_MUTED, fnt)
+            self.hits.append((bx1 - bw, by0, bx1, by0 + bh, "reset", (key, default)))
         ty = y_label + S(32)
         if gradient:
             self.gradient_track(x0, x1, ty, low, high)
@@ -277,9 +286,9 @@ class ControlWindow:
         S = self.S
         self._card_frame(x0, y0, x1, y1, "Front light", "Desk illumination", bool(v["front_on"]), "front_on")
         sx0, sx1 = x0 + S(24), x1 - S(24)
-        self._slider(sx0, sx1, y0 + S(92), "Brightness", f"{v['front_bright']}%", "front_bright",
+        self._slider(sx0, sx1, y0 + S(112), "Brightness", f"{v['front_bright']}%", "front_bright",
                      1, 100, v["front_bright"])
-        self._slider(sx0, sx1, y0 + S(166), "Color temperature", f"{v['front_ct']} K", "front_ct",
+        self._slider(sx0, sx1, y0 + S(200), "Color temperature", f"{v['front_ct']} K", "front_ct",
                      2700, 6500, v["front_ct"], gradient=True)
 
     def _back_card(self, x0, y0, x1, y1):
@@ -303,9 +312,9 @@ class ControlWindow:
             self.hits.append((sx0, my0, sx0 + seg_w, my0 + mh, "mode", key))
 
         if not solid:
-            c.create_text(x0 + S(24), y0 + S(132), text="Live colors (left and right of the screen)", anchor="nw",
+            c.create_text(x0 + S(24), y0 + S(126), text="Live colors (left and right of the screen)", anchor="nw",
                           fill=C_MUTED, font=self.font(13), tags="ui")
-            width, height = int(x1 - x0 - 2 * S(24)), max(6, int(S(18)))
+            width, height = int(x1 - x0 - 2 * S(24)), max(6, int(S(14)))
             left, right = self._colors()
             bar = Image.new("RGB", (2, 1))
             bar.putpixel((0, 0), left if on else (30, 38, 58))
@@ -315,10 +324,12 @@ class ControlWindow:
             ImageDraw.Draw(mask).rounded_rectangle((0, 0, width - 1, height - 1), radius=height // 2, fill=255)
             bar.putalpha(mask)
             self._bar_photo = ImageTk.PhotoImage(bar)
-            c.create_image(x0 + S(24), y0 + S(156), anchor="nw", image=self._bar_photo, tags="ui")
-            c.create_text(x0 + S(24), y0 + S(190),
-                          text="The lamp keeps this light at full brightness\nwhile colors stream; it cannot be dimmed.",
-                          anchor="nw", fill=C_DIM, font=self.font(13), tags="ui")
+            c.create_image(x0 + S(24), y0 + S(150), anchor="nw", image=self._bar_photo, tags="ui")
+            sx0, sx1 = x0 + S(24), x1 - S(24)
+            self._slider(sx0, sx1, y0 + S(178), "Saturation", f"{v['saturation']}%", "saturation",
+                         50, 200, v["saturation"], default=110)
+            self._slider(sx0, sx1, y0 + S(234), "Smoothness", f"{v['smoothness']}%", "smoothness",
+                         0, 100, v["smoothness"], default=21)
             return
 
         # solid color: swatches, a custom color, brightness
@@ -327,7 +338,7 @@ class ControlWindow:
         custom = current not in [col.upper() for col in colors]
         if custom:
             colors.append(current)
-        cx, cy, r, gap = x0 + S(24) + S(16), y0 + S(146), S(16), S(44)
+        cx, cy, r, gap = x0 + S(24) + S(16), y0 + S(160), S(16), S(44)
         for i, col in enumerate(colors):
             px = cx + i * gap
             selected = col.upper() == current
@@ -340,7 +351,7 @@ class ControlWindow:
         self.oval(px - r, cy - r, px + r, cy + r, fill=C_TRACK, outline=C_LINE, tags="ui")
         self.ctext(px, cy, "+", C_TEXT, self.font(18, "bold"))
         self.hits.append((px - r, cy - r, px + r, cy + r, "picker", None))
-        self._slider(x0 + S(24), x1 - S(24), y0 + S(176), "Brightness", f"{v['solid_bright']}%", "solid_bright",
+        self._slider(x0 + S(24), x1 - S(24), y0 + S(210), "Brightness", f"{v['solid_bright']}%", "solid_bright",
                      1, 100, v["solid_bright"])
 
     # ----- mouse ----------------------------------------------------------------
@@ -353,7 +364,8 @@ class ControlWindow:
     def _hover(self, event):
         hit = self._find(event.x, event.y)
         self.canvas.config(cursor="hand2" if hit else "")
-        button = hit[4] if hit and hit[4] in ("winmin", "winclose") else None
+        button = hit[4] if hit and hit[4] in ("winmin", "winclose") else (
+            ("reset", hit[5][0]) if hit and hit[4] == "reset" else None)
         if button != self._hover_btn:
             self._hover_btn = button
             self.refresh()
@@ -369,6 +381,12 @@ class ControlWindow:
         if kind in ("winmin", "winclose"):               # both hide the window; the app lives in the tray
             self._hover_btn = None
             self.win.withdraw()
+        elif kind == "reset":
+            key, default = data
+            self.panel.values[key] = default
+            self._apply_for(key)(default)
+            self.panel._save()
+            self.refresh()
         elif kind == "toggle":
             if data == "front_on":
                 self.panel._toggle_front(not self.panel.values["front_on"])
@@ -386,6 +404,11 @@ class ControlWindow:
         elif kind == "slider":
             self.drag = data
             self._set_from_x(event.x)
+
+    def _apply_for(self, key):
+        return {"front_bright": self.engine.set_front_brightness, "front_ct": self.engine.set_front_ct,
+                "solid_bright": self.engine.set_solid_brightness, "saturation": self.engine.set_saturation,
+                "smoothness": self.engine.set_smoothness}[key]
 
     def _picked(self, hex_color):
         self.panel.set_solid_color(hex_color)
@@ -407,8 +430,7 @@ class ControlWindow:
         key = self.drag[0]
         self._set_from_x(event.x)
         self.drag = None
-        apply = {"front_bright": self.engine.set_front_brightness, "front_ct": self.engine.set_front_ct,
-                 "solid_bright": self.engine.set_solid_brightness}[key]
+        apply = self._apply_for(key)
         self.panel._commit(key, self.panel.values[key], apply)
         self.refresh()
 
@@ -422,6 +444,10 @@ class ControlWindow:
             value = int(round(value))
         if value != self.panel.values[key]:
             self.panel.values[key] = value
+            if key == "saturation":                                   # these two apply while dragging
+                self.engine.set_saturation(value)
+            elif key == "smoothness":
+                self.engine.set_smoothness(value)
             self.refresh()
 
     def show(self):
